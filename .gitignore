@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/raw/swoopo/*.tsv
+.venv/
+*.egg-info/
