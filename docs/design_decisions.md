@@ -1,6 +1,6 @@
 # Design Decisions
 
-This document logs every non-trivial design decision made for this project, along with the reasoning behind it. Keep this updated continuously as the project evolves — it is the single source of truth for "why did we do it this way", both for staying in sync between collaborators and for writing the thesis methodology chapter.
+This document logs every non-trivial design decision made for this project, along with the reasoning behind it. We will keep this updated continuously as the project evolves — it is the single source of truth for "why did we do it this way", both for staying in sync between collaborators and for writing the thesis methodology chapter.
 
 ---
 
