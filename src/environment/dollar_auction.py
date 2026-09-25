@@ -55,8 +55,16 @@ class AuctionResult:
     history: List[Tuple[str, int]] = field(default_factory=list)
     # history is a list of (who_bid, bid_amount) pairs in chronological
     # order, e.g. [("agent", 1), ("opponent", 2), ("agent", 3), ...]
-    # This is useful later for computing Lemma 1 (prefix strategy)
-    # side-information in the ELP implementation.
+
+    agent_state_trace: List[Tuple[int, int]] = field(default_factory=list)
+    # The ordered sequence of states (x, y) at which the AGENT (not the
+    # opponent) was asked to decide a bid this round, in chronological
+    # order. This is exactly the "(x1,y1), ..., (xn,yn)" sequence used
+    # in Lemma 1 (Waniek et al., Section 3.2) to infer the outcome of
+    # any strategy g that is a prefix of the agent's actual strategy,
+    # without having to play g directly. Required by ELP
+    # (src/algorithms/elp.py); ignored by algorithms that don't need
+    # side-information (EXP3, EXP3.S).
 
 
 class DollarAuction:
@@ -135,6 +143,7 @@ class DollarAuction:
         # bids[player] = that player's last bid so far
         agent_bid, opponent_bid = 0, 0
         history: List[Tuple[str, int]] = []
+        agent_state_trace: List[Tuple[int, int]] = []
 
         current, other = ("agent", "opponent") if agent_starts else (
             "opponent",
@@ -144,6 +153,11 @@ class DollarAuction:
         while True:
             x = agent_bid if current == "agent" else opponent_bid
             y = opponent_bid if current == "agent" else agent_bid
+
+            if current == "agent":
+                # Record the state BEFORE the decision, exactly the
+                # (xi, yi) sequence Lemma 1 replays over.
+                agent_state_trace.append((x, y))
 
             strategy = agent_strategy if current == "agent" else opponent_strategy
             proposed_bid = strategy(x, y)
@@ -179,7 +193,9 @@ class DollarAuction:
                 winner = "agent" if agent_bid >= opponent_bid else "opponent"
                 break
 
-        return self._settle(winner, agent_bid, opponent_bid, history)
+        return self._settle(
+            winner, agent_bid, opponent_bid, history, agent_state_trace
+        )
 
     def _settle(
         self,
@@ -187,6 +203,7 @@ class DollarAuction:
         agent_bid: int,
         opponent_bid: int,
         history: List[Tuple[str, int]],
+        agent_state_trace: List[Tuple[int, int]],
     ) -> AuctionResult:
         """
         Compute all-pay payoffs given the auction outcome.
@@ -211,6 +228,7 @@ class DollarAuction:
             agent_payoff=agent_payoff,
             opponent_payoff=opponent_payoff,
             history=history,
+            agent_state_trace=agent_state_trace,
         )
 
     @staticmethod
