@@ -234,16 +234,10 @@ def run_config(cfg: dict) -> dict:
 
 
 def make_individual_plot(config_result: dict):
-    """
-    Saves TWO SEPARATE figures (not subplots sharing one file), each
-    with its own fully-labeled x/y axes, so each plot is self-
-    contained and readable on its own:
-        1. regret_cumulative.png   -- cumulative static regret vs round
-        2. moving_avg_reward.png   -- moving average reward vs round
-    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 
     label = config_result["label"]
     T = config_result["T"]
@@ -251,13 +245,21 @@ def make_individual_plot(config_result: dict):
     regret_matrix = config_result["regret_matrix"]
     moving_avg_matrix = config_result["moving_avg_matrix"]
 
+    marker_spacing = max(1, T // 10) 
+
     # --- Figure 1: cumulative static regret ---
     fig1, ax1 = plt.subplots(figsize=(8, 5))
     mean_regret = regret_matrix.mean(axis=0)
     std_regret = regret_matrix.std(axis=0)
-    ax1.plot(rounds, mean_regret, color="#2A6F77", label="mean static regret")
+    
+    ax1.plot(rounds, mean_regret, color="#2A6F77", label="mean static regret", 
+             marker='|', markevery=marker_spacing, markersize=8)
+    
     ax1.fill_between(rounds, mean_regret - std_regret, mean_regret + std_regret,
                       alpha=0.2, color="#2A6F77", label="±1 std across seeds")
+    
+    ax1.yaxis.set_major_locator(MaxNLocator(10))
+    
     ax1.set_xlabel("Round (t)  ->  1 to T, one full auction per round")
     ax1.set_ylabel("Cumulative static regret  U_A(T)\n(higher = worse; accumulates over all rounds so far)")
     ax1.set_title(f"Stage 0 [{label}]: cumulative static regret")
@@ -268,14 +270,15 @@ def make_individual_plot(config_result: dict):
     plt.close(fig1)
     print(f"  Regret plot saved to: {regret_path}")
 
-    # --- Figure 2: moving average reward ---
     fig2, ax2 = plt.subplots(figsize=(8, 5))
     mean_ma = moving_avg_matrix.mean(axis=0)
     std_ma = moving_avg_matrix.std(axis=0)
     ax2.plot(rounds, mean_ma, color="#C1583A",
-              label=f"moving avg reward (window={MOVING_AVG_WINDOW} rounds)")
+              label=f"moving avg reward (window={MOVING_AVG_WINDOW} rounds)",
+              marker='|', markevery=marker_spacing, markersize=8)
     ax2.fill_between(rounds, mean_ma - std_ma, mean_ma + std_ma,
                       alpha=0.2, color="#C1583A")
+    ax2.yaxis.set_major_locator(MaxNLocator(10))
     ax2.set_xlabel("Round (t)  ->  1 to T, one full auction per round")
     ax2.set_ylabel(f"Reward averaged over the last {MOVING_AVG_WINDOW} rounds\n"
                      f"(local/recent performance, NOT cumulative)")
@@ -292,17 +295,25 @@ def make_comparison_plot(config_results: list):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 
     fig, ax = plt.subplots(figsize=(8, 5))
     colors = ["#2A6F77", "#C1583A", "#6A5ACD", "#4C9A2A"]
+    
+    linestyles = ['-', '--', '-.', ':']
 
     for i, cfg_result in enumerate(config_results):
         T = cfg_result["T"]
         rounds = np.arange(1, T + 1)
         mean_regret = cfg_result["regret_matrix"].mean(axis=0)
+        marker_spacing = max(1, T // 10)
+        
         ax.plot(rounds, mean_regret, label=cfg_result["label"],
-                 color=colors[i % len(colors)])
+                 color=colors[i % len(colors)],
+                 linestyle=linestyles[i % len(linestyles)], # Variasi garis
+                 marker='|', markevery=marker_spacing, markersize=8)
 
+    ax.yaxis.set_major_locator(MaxNLocator(10)) # Detail sumbu Y dinamis
     ax.set_xlabel("Round (t)")
     ax.set_ylabel("Mean cumulative static regret")
     ax.set_title("Stage 0: regret comparison across parameter configurations")
