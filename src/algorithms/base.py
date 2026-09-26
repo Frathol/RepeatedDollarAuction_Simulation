@@ -52,7 +52,7 @@ class BanditAlgorithm(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def update(self, arm: int, reward: float) -> None:
+    def update(self, arm: int, reward: float, info: dict | None = None) -> None:
         """
         Update the algorithm's internal state after observing the
         outcome of playing `arm` and receiving `reward`.
@@ -65,6 +65,19 @@ class BanditAlgorithm(ABC):
             The observed reward, expected to lie in [0, 1] (see
             DollarAuction.normalize_reward in
             src/environment/dollar_auction.py).
+        info : dict, optional
+            Extra side-information some algorithms need beyond the
+            scalar reward of the arm played. Plain reward-only
+            algorithms (EXP3, EXP3.S) ignore this entirely. ELP
+            requires it: runner.py must pass
+            {"agent_state_trace": AuctionResult.agent_state_trace}
+            so ELP can apply Lemma 1 (prefix side-information) to
+            infer rewards for every strategy that is a prefix of the
+            one actually played, not just the played arm itself. This
+            keeps the interface uniform -- runner.py always calls
+            update() the same way regardless of which algorithm is
+            active; algorithms that don't need `info` simply don't
+            read it.
         """
         raise NotImplementedError
 
