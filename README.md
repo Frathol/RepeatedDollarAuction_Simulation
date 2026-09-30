@@ -1,4 +1,4 @@
-# Dollar Auction Bandit — Adaptive Adversary Edition
+# Dollar Auction Bandit — Adaptive Adversary
 
 > **Major design pivot (see `docs/design_decisions.md` §13–18 for full rationale):**
 > The opponent (Bob) is no longer a purely *scripted/oblivious* agent whose regime
