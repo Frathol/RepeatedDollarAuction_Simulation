@@ -28,8 +28,33 @@ how far the signal has climbed back up from its historical low point
 -- a sustained climb means the signal was consistently below its old
 mean for a while and has now "used up" that slack, which is exactly
 the signature of a genuine downward mean-shift (e.g. Bob's regime
-flipping from rational to escalating, dragging the agent's achievable
+switching from rational to escalating, dragging the agent's achievable
 reward down).
+
+IMPORTANT FINDING FROM TESTING THIS MODULE -- the false-alarm vs delay
+tradeoff is fundamental, not a bug:
+    Early testing on a synthetic 0.8-to-0.3 mean shift showed that no
+    single "reasonable-looking" (delta, threshold) pair gave BOTH fast
+    detection AND zero false alarms during the stable pre-change
+    period. This is not a coding error -- it is a well-known property
+    of CUSUM/Page-Hinkley-style tests: U_t behaves like a biased random
+    walk, and over any sufficiently long stable window it will
+    eventually cross ANY fixed threshold purely by chance. The
+    standard way to reason about this in the change-detection
+    literature is via Average Run Length (ARL): ARL0 = average number
+    of stable rounds before a FALSE alarm (want this large), ARL1 =
+    average number of rounds after a true change before it is DETECTED
+    (want this small). Raising `threshold` increases both ARL0 (good)
+    and ARL1 (bad) -- there is no free lunch, only a tunable
+    trade-off point.
+    CONSEQUENCE FOR THIS PROJECT: do not reuse a threshold tuned on one
+    synthetic signal (or copied from a textbook default) against a
+    different signal's noise scale -- it must be recalibrated against
+    the ACTUAL reward signal's noise level for each experiment
+    configuration. Use `PageHinkleyDetector.calibrate_threshold()`
+    below against a reference sample of STABLE (pre-changepoint, or
+    known-no-changepoint) reward data before running a real Stage 1a/1b
+    experiment, rather than assuming a fixed default is correct.
 
 This module is intentionally standalone: it does not know anything
 about bandits, arms, or the Dollar Auction. It only consumes a stream
@@ -188,3 +213,75 @@ class PageHinkleyDetector:
     def current_gap(self) -> float:
         """U_t - m_t, the quantity compared against `threshold`."""
         return self._U - self._m
+
+    @staticmethod
+    def calibrate_threshold(
+        stable_reference_signal: List[float],
+        delta: float,
+        mean_alpha: float | None,
+        target_false_alarms: int = 0,
+        candidate_thresholds: List[float] | None = None,
+    ) -> float:
+        """
+        Pick the SMALLEST threshold that keeps the number of false
+        alarms on `stable_reference_signal` at or below
+        `target_false_alarms`, given fixed delta and mean_alpha.
+
+        This directly implements the ARL0-based calibration approach
+        described in the module docstring: rather than guessing a
+        threshold and hoping it generalizes, run the detector on data
+        you KNOW contains no real changepoint (e.g. the first N rounds
+        of a single-switch Bob experiment, before switch_round), and
+        pick the smallest threshold that stays quiet on that data.
+        Smaller is preferred because -- all else equal -- a smaller
+        threshold detects genuine changes faster (lower ARL1); we are
+        just looking for the smallest one that doesn't also cry wolf
+        on data we know is stable.
+
+        Parameters
+        ----------
+        stable_reference_signal : list[float]
+            A sequence of observations known to contain NO true
+            changepoint (e.g. rewards from rounds 1..switch_round-1
+            of a single-switch Bob run, or an entire run against
+            Alice, which never changes regime).
+        delta, mean_alpha : as in the constructor -- held fixed during
+            calibration; only `threshold` is searched over.
+        target_false_alarms : int, default 0
+            Maximum number of false alarms tolerated on the reference
+            signal. 0 means "find a threshold that never fires on data
+            we know is stable" -- the strictest, safest choice, at the
+            cost of slower detection of real changes (per the ARL0 vs
+            ARL1 tradeoff).
+        candidate_thresholds : list[float], optional
+            Thresholds to try, smallest first. Defaults to a log-ish
+            sweep from 0.05 to 5.0.
+
+        Returns
+        -------
+        float
+            The calibrated threshold. Raises ValueError if no
+            candidate in the search range satisfies the false-alarm
+            constraint (try a wider `candidate_thresholds` list).
+        """
+        if candidate_thresholds is None:
+            candidate_thresholds = [
+                0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 5.0,
+            ]
+
+        for threshold in sorted(candidate_thresholds):
+            det = PageHinkleyDetector(
+                delta=delta, threshold=threshold, mean_alpha=mean_alpha,
+                auto_reset=True,
+            )
+            n_false = sum(
+                1 for x in stable_reference_signal if det.update(x)
+            )
+            if n_false <= target_false_alarms:
+                return threshold
+
+        raise ValueError(
+            f"No candidate threshold in {candidate_thresholds} kept false "
+            f"alarms <= {target_false_alarms} on the given reference signal. "
+            "Try a wider/larger candidate_thresholds list, or a larger delta."
+        )

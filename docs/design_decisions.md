@@ -1,28 +1,30 @@
 # Design Decisions
 
-This document logs every non-trivial design decision made for this project, along with the reasoning behind it. We will keep this updated continuously as the project evolves — it is the single source of truth for "why did we do it this way", both for staying in sync between collaborators and for writing the thesis methodology chapter.
+This document logs every non-trivial design decision made for this project, along with the reasoning behind it. Keep this updated continuously as the project evolves.
+
+> **Revision note:** §1 and §2 below were revised after adopting the adaptive-adversary design (see §13). The original versions justified the adversarial-bandit framework partly by analogy ("opponent is strategic") and partly by non-stationarity alone; both were found to be imprecise once checked against the formal definition of *adaptive adversary*. The revised versions below reflect the corrected, formally grounded reasoning.
 
 ---
 
 ## 1. Adversarial bandit over stochastic (Bayesian/frequentist) bandit
 
-**Decision**: The learning agent uses an *adversarial* multi-armed bandit framework (ELP, EXP3, EXP3.S), not a *stochastic* bandit framework (UCB, Thompson Sampling).
+**Decision**: The learning agent uses an *adversarial* multi-armed bandit framework (ELP, EXP3, EXP3.S), not a *stochastic* bandit framework (UCB, Thompson Sampling), and not a *non-stationary stochastic* framework (Discounted UCB, Sliding-Window UCB) either.
 
-**Reasoning**: Stochastic bandit algorithms assume each arm has a fixed underlying success probability θ_k that is independent of the agent's own behavior, only needing to be estimated from accumulated data. In the Dollar Auction, the reward of a given strategy is not a fixed property of that strategy — it depends entirely on how the opponent reacts, and the opponent can be strategic and can change behavior abruptly and drastically (the sunk-cost fallacy transition). This violates the core assumption behind stochastic bandits. Adversarial bandits make no assumption about the source of rewards, and their regret guarantees hold even against a worst-case, adaptive opponent — making them the theoretically appropriate choice. This is also the choice made by our primary reference, Waniek, Tran-Thanh, & Michalak (2016).
+**Reasoning (revised)**: The formal definition of an adaptive adversary (see e.g. Slivkins 2019, Ch. 5-6; verified via search) is: the reward/loss vector at round *t* may depend on the algorithm's history of chosen arms in *previous rounds*, π₁, …, π_{t-1}. Bob (§13) is deliberately designed to satisfy exactly this: his probability of entering the escalation regime at round *t* is a function of the agent's arm choices in a rolling window of prior rounds. This is not merely "non-stationary" (reward changing over time on some fixed schedule) — it is reward that changes *because of* the algorithm's own choices.
 
-**Rejected alternative**: Discounted Bayesian MAB (Thompson Sampling with a decay factor γ<1 on the Beta-Binomial update), as sketched in an early (fabricated/unverified) draft. Rejected because it still fundamentally assumes rewards drift slowly from a stochastic source, rather than being designed for strategic, abruptly-changing opponents.
+This distinction matters concretely: non-stationary *stochastic* methods (Discounted UCB, Sliding-Window UCB, CUSUM-UCB) all require, for their regret proofs to hold, that the reward-generating process be independent of the algorithm's own action sequence (i.i.d. within each stationary segment, segment boundaries fixed independently of the algorithm). Bob's design explicitly violates this requirement. Adversarial bandit algorithms (EXP3 and its descendants) retain valid regret guarantees under adaptive adversaries — Auer et al. (2002)'s original proof covers oblivious adversaries, but Poland (2005) provides the argument extending it to adaptive adversaries, which Waniek et al. cite explicitly (footnote 2) to justify applying ELP/Mannor-Shamir-style guarantees in their (already adversarial-by-design) setting.
+
+**Consequence for baselines**: Discounted UCB / Sliding-Window UCB are **not** included as baselines in this design, because their theoretical guarantees do not apply here — including them would require either restricting the comparison to a regime where Bob happens to behave close to oblivious (defeating the purpose of the adaptive design) or reporting their performance without a valid theoretical backing (acceptable only as an empirical curiosity, clearly labeled as such, not as a principled baseline).
+
+**Rejected alternative**: Discounted Bayesian MAB (Thompson Sampling with a decay factor), as sketched in an early (fabricated/unverified) draft. Rejected because it assumes an i.i.d. reward source per segment, which Bob's design violates outright.
 
 ---
 
 ## 2. Only the main agent learns; opponents are scripted
 
-**Decision**: Alice and Bob (the opponent agents) are rule-based/reactive, not learning agents. Only the primary agent (running ELP/EXP3/EXP3.S) accumulates cross-round experience and optimizes its behavior.
+**Decision**: The learning agent (running ELP/EXP3/EXP3.S) is the only one that maintains an internal model whose purpose is to *maximize* its own long-run reward. Bob maintains internal state (a rolling window of the agent's recent arm choices) and reacts to it, but this state is not used to optimize any objective of Bob's own — it merely determines a probability of entering a scripted escalation behavior.
 
-**Reasoning**: The research question is specifically about whether a *learning* agent can remain robust and adapt efficiently when facing a population exhibiting *bounded rationality* (the sunk-cost fallacy). If opponents also learned optimally, the experiment would instead be testing competition between two learning algorithms — a different (and valid, but out of scope) question. Bob is deliberately scripted because sunk-cost fallacy is, by definition, a failure to rationally adjust behavior based on past outcomes — making him a learner would contradict the phenomenon being modeled.
-
-**Note on "dynamic but not learning"**: Bob's behavior changes over time (t) and reacts to in-auction state (his own accumulated sunk cost, x), but this is *scripted* non-stationarity, not *learned* adaptation. From the learning agent's point of view, the environment is genuinely non-stationary — the agent does not know Bob's rules or switch points in advance.
-
-**Optional future extension**: A scenario where one opponent also runs a bandit algorithm (mirroring Theorem 8 in Waniek et al., which shows convergence to Nash equilibrium when both players use ELP) may be added as a supplementary experiment, kept separate from the core design to avoid confounding the main switching-regret analysis.
+**Reasoning**: This distinction is worth being precise about now that Bob has cross-round memory (§13), which could superficially look like "learning." The key difference: a learning agent (ELP/EXP3/EXP3.S) chooses actions specifically to improve a measured objective (cumulative reward) based on feedback about that objective. Bob's state update has no such objective — it is a fixed, hand-designed reactive function (aggressiveness score → escalation probability) that does not adapt or improve over time in response to how well "escalating" serves any goal of Bob's. Bob is *adaptive* (in the bandit-theory sense of §1) but not *learning* (in the optimization sense). Both properties are independent; Bob has the former but not the latter.
 
 ---
 
@@ -123,3 +125,67 @@ This document logs every non-trivial design decision made for this project, alon
 **Decision**: [TO BE FINALIZED — recommended: every experiment run accepts an explicit `rng` (numpy `Generator`) seeded from a value stored in `src/simulation/config.py`; each stage's results are averaged over multiple seeds (recommended: ≥50-100 runs per configuration) with mean ± confidence interval reported, not single-run point estimates.]
 
 **Reasoning**: A single simulation run is not sufficient evidence for any claim about regret, detection delay, or survival — this was one of the core methodological critiques of the earlier flawed draft (which reported single-run numbers with no replication). Reporting averages with confidence intervals across many seeds is required for any result presented as a thesis finding.
+
+---
+
+## 13. Bob redesigned as a genuine adaptive adversary
+
+**Decision**: Bob's regime transition (rational → escalation) is no longer driven by a fixed `switch_round`/`switch_points` schedule. Instead, Bob maintains a rolling window (size `W`, a new tunable parameter) of the agent's most recently played arm thresholds (θ values), computes an **aggressiveness score** from that window (e.g. the mean θ played), and derives an **escalation probability** from that score (e.g. `p_escalate = min(1, aggressiveness_score / budget)`, exact functional form TBD/tunable). At the start of each round, Bob draws whether it enters escalation for that round based on this probability.
+
+**Reasoning**: See README preamble and `notation.md` — this both (a) satisfies the formal definition of adaptive adversary, directly justifying the adversarial-bandit framework choice (§1) rather than relying on analogy, and (b) is arguably a more psychologically faithful model of sunk-cost fallacy, which in the literature is typically triggered by a pattern of repeated aggressive engagement rather than an external clock.
+
+**What stays unchanged**: Once Bob has entered escalation for a given round, the within-auction dynamics (sunk-cost threshold, exponential escalation-probability curve, escalation ceiling) are exactly as before (see original `bob_sunkcost.py` logic). Only the *mechanism deciding which regime applies this round* has changed.
+
+**Within-round vs. cross-round reactivity — do not conflate these**: Bob (and Alice) have always been reactive *within* a single auction (their strategy function depends on the live bid state (x, y) of that auction) — this is inherent to the f(x,y) formalization in Waniek et al. and does **not**, by itself, make an opponent an "adaptive adversary" in the bandit-theoretic sense. Only dependence on the agent's arm choices in **previous bandit rounds** counts. Conflating these two notions of "reactive" was an error caught and corrected during this project's development; keep the distinction explicit in any write-up.
+
+---
+
+## 14. ELP's Lemma-1 validity under an adaptive opponent — a per-round vs. per-phase distinction
+
+**Decision**: ELP's prefix-replay side-information mechanism (Lemma 1) remains usable **within a single round**, but is **not** valid for computing multi-round hindsight (needed for regret) via cheap trace-replay; multi-round hindsight requires full re-simulation.
+
+**Reasoning**: Bob's regime for round *t* is fully determined *before* round *t*'s auction begins (it depends only on history up to round *t*-1). So within round *t*, Bob behaves as a fixed (if possibly probabilistic) strategy, and the existing Lemma-1 replay logic (see `elp.py`, `_replay_lemma1`) is unaffected for inferring "what arm *g* would have earned this round, given the auction played out as recorded." This is a **single-round** counterfactual, and remains valid.
+
+What is **not** valid: extending this to "what would my total reward have been across an entire phase if I had played arm *g* consistently?" (needed for both static and dynamic regret hindsight, see `run_stage0.py`'s `hindsight_sums` pattern). If arm *g* were actually played across the phase, the agent's revealed aggressiveness history would differ from what actually happened, which would change Bob's realized escalation-probability draws in every subsequent round of that phase — a genuinely different simulated trajectory, not something derivable from the original trace. Multi-round/phase-wide hindsight under an adaptive opponent requires re-simulating the phase from scratch with a frozen copy of Bob's pre-phase state (see §16).
+
+**Consequence**: `elp.py`'s existing per-round replay code does not need to change. What changes is upstream, in how experiment scripts compute the hindsight benchmark needed for regret (§16) — that logic must not naively reuse per-round replayed values as if they compose into a valid multi-round counterfactual.
+
+---
+
+## 15. Ground-truth regime-switch times are recorded during simulation, not fixed in advance
+
+**Decision**: `Bob.is_escalating_at(t)`-style ground truth is replaced by a **runtime log**: at the start of every round, before that round's auction is played, the runner records `(t, bob.current_regime())` into a per-run history. This realized log — not a pre-set constant — is what detection-delay and phase-boundary calculations use downstream.
+
+**Reasoning**: Because escalation is now a probabilistic function of the agent's own play history, the actual round(s) at which Bob enters escalation can differ across seeds, and even across algorithms (an algorithm that happens to play aggressively early may provoke escalation sooner than a conservative one). There is no longer a single "true" switch_round known in advance; it is a realized outcome of each individual simulation run.
+
+**Consequence for experiment naming**: Stage 1a ("single switch") and Stage 1b ("recurring switch") are retained as configuration *regimes* (e.g. tuning Bob's escalation-probability function and window size so that, empirically, escalation episodes tend to be rare/single vs. frequent/recurring), not as literal fixed schedules. Document the realized switch-time distribution observed across seeds for each configuration as part of reporting results — this distribution is itself a meaningful thing to report, not just a nuisance to average away.
+
+---
+
+## 16. Dynamic regret hindsight computation under an adaptive opponent requires full re-simulation
+
+**Decision**: To compute the phase-wide hindsight term `max_g Σ_{t∈phase} r_g(t)` needed for dynamic/switching regret (see prior static-regret critique, unchanged), each candidate arm *g* must be evaluated by **re-simulating the entire phase from a frozen snapshot of Bob's state at the start of that phase**, with Bob reacting naturally (via its normal adaptive logic) to *g* being played consistently — not by replaying/reusing the original trace.
+
+**Reasoning**: See §14. This is a direct consequence of Bob's adaptivity: a counterfactual "what if arm g had been played throughout this phase" is only meaningful if Bob is allowed to react to that counterfactual history, which requires genuinely running the simulation forward under that counterfactual, not inferring it from what actually happened under a different arm sequence.
+
+**Practical implication (must be implemented carefully)**: Any hindsight-computation code path must operate on a **deep-copied / frozen** Bob instance, distinct from the live Bob instance being updated by the real simulation loop. Accidentally sharing state between the two would silently corrupt both the real run and the regret calculation. This is now the single most important correctness invariant in the codebase and should be covered by an explicit unit test (confirm that running hindsight evaluations does not alter the original Bob instance's internal history).
+
+**Cost**: This is computationally more expensive than the old single-replay approach (full phase re-simulation per candidate arm, rather than one cheap trace replay), which should be accounted for when choosing `T`, phase granularity, and the number of seeds for Stage 1a/1b experiments.
+
+---
+
+## 17. N-player: aggressiveness signal aggregated across the population
+
+**Decision**: In the N-player extension, each Bob-type opponent's escalation probability is driven by an aggressiveness score aggregated across **the entire population's** recent interaction history (e.g. the mean θ played by anyone against anyone, within the rolling window), not just that individual opponent's own direct interaction history with the agent.
+
+**Reasoning**: This captures a more realistic "contagion" dynamic — one aggressive participant can provoke elevated escalation risk across the population, not just in their direct opponent — and is a natural, low-complexity way to make the N-player extension meaningfully different from N independent copies of the 2-player case. Exact aggregation function (population mean, some other statistic) is TBD and should be treated as a tunable design choice, documented here once finalized.
+
+---
+
+## 18. Asymmetric-cost regret — optional extension layer
+
+**Decision (optional, not yet committed)**: A variant of switching regret may be defined with asymmetric weighting: rounds where the algorithm was slow to detect an actual escalation are penalized more heavily than rounds where it over-cautiously treated a still-rational opponent as risky.
+
+**Reasoning**: Reflects the asymmetric cost structure typical of security/detection domains (false negatives costlier than false positives) — see the corresponding discussion in the topic-narrative chat log. This is a re-weighting of the *evaluation* of realized outcomes; it does not change how Bob behaves or how the environment/algorithms operate. It can be added independently of, and on top of, the adaptive-Bob design (§13) and the dynamic-regret machinery (§16) without further structural changes.
+
+**Status**: Not yet implemented; flagged as a candidate scope addition pending advisor confirmation on time budget, per the earlier discussion of trade-offs between narrative depth (security relevance) and implementation risk.
