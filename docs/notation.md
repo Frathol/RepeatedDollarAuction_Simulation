@@ -90,6 +90,20 @@ Consistent notation used across code, documentation, and the thesis write-up. Ba
 
 ---
 
+## Adaptive Bob (NEW — adaptive-adversary redesign)
+
+| Symbol / Name | Meaning |
+|---|---|
+| `W` | Size of Bob's rolling memory window (number of past rounds' arm choices he considers when computing his aggressiveness score) |
+| `aggressiveness_score(t)` | A statistic (e.g. mean θ) computed over the agent's arm choices in the `W` rounds preceding round `t` |
+| `p_escalate(t)` | Escalation probability for round `t`, a function of `aggressiveness_score(t)` (exact functional form tunable — see `design_decisions.md` §13) |
+| `current_regime()` | Bob's realized regime for the round about to be played, determined by drawing against `p_escalate(t)` **before** that round's auction starts |
+| `observe_round_outcome(arm_played)` | Method called **after** each round to update Bob's rolling history with the arm the agent actually played |
+| `realized_regime_log` | The runtime-recorded sequence of `(t, current_regime())` pairs for one simulation run — replaces the old fixed `switch_round`/`switch_points` ground truth (see `design_decisions.md` §15) |
+| frozen/snapshot Bob | A deep-copied instance of Bob, used **only** for hindsight/counterfactual evaluation, whose state must never be mutated by or shared with the live simulation's Bob instance (see `design_decisions.md` §16 — this is the most important correctness invariant introduced by the pivot) |
+
+---
+
 ## Bayesian bandit notation (Thompson Sampling — used for comparison/critique only, not as the primary algorithm)
 
 | Symbol | Meaning |
@@ -100,16 +114,12 @@ Consistent notation used across code, documentation, and the thesis write-up. Ba
 
 ---
 
-## Opponent-agent parameters (Alice & Bob)
+## Opponent-agent parameters (Alice — unchanged; Bob — see Adaptive Bob table above)
 
 | Symbol / Name | Meaning |
 |---|---|
-| `μ` (mu, Alice/Bob rational-phase parameter) | **Note**: unrelated to the Page-Hinkley running average `μ_t` or the stochastic-bandit `μ̂_k` above — this `μ` is the fraction of the stake beyond which the rational agent folds (e.g. `μ=0.8` folds once their own bid would exceed 80% of the stake). Disambiguate explicitly in writing if all three appear in the same section |
-| `sunk_cost_threshold` | The amount of Bob's own accumulated bid (`x`) within one auction beyond which escalation dynamics can trigger |
-| `escalation_rate` | Rate parameter of Bob's exponential escalation-probability curve |
-| `escalation_ceiling` | Hard cap on how high Bob will ever bid while escalating |
-| `switch_round` | (single-switch mode) The round after which Bob permanently enters escalation mode |
-| `switch_points` | (recurring-switch mode) Sorted list of rounds at which Bob's regime flips |
+| `μ` (mu, Alice's rational-phase fold-threshold fraction) | **Unrelated** to Page-Hinkley's `μ_t` or stochastic-bandit `μ̂_k`; disambiguate explicitly if all appear in the same section |
+| `sunk_cost_threshold`, `escalation_rate`, `escalation_ceiling` | Within-round escalation dynamics parameters — unchanged by the adaptive pivot; these still govern behavior *once* Bob has entered escalation for a given round |
 
 ---
 

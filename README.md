@@ -1,15 +1,30 @@
-# Dollar Auction Bandit — Mitigating Sunk-Cost Fallacy with Adversarial Multi-Armed Bandits
+# Dollar Auction Bandit — Adaptive Adversary Edition
+
+> **Major design pivot (see `docs/design_decisions.md` §13–18 for full rationale):**
+> The opponent (Bob) is no longer a purely *scripted/oblivious* agent whose regime
+> switches on a fixed, pre-determined schedule. Bob is now a **genuine adaptive
+> adversary** in the formal bandit-theory sense: his probability of entering the
+> "escalation" (sunk-cost) regime at round *t* depends on the **history of arms the
+> agent actually played in previous rounds**, not on a wall-clock schedule. This
+> directly matches the definition of adaptive adversary used to justify adversarial
+> bandits (EXP3-family) in the first place, and is the reason this project keeps that
+> framework rather than switching to non-stationary *stochastic* bandit methods
+> (Discounted UCB, Sliding-Window UCB), whose regret guarantees formally require
+> reward to be independent of the algorithm's own choices — a requirement this
+> design deliberately violates.
 
 This thesis extends the framework of **Waniek, Tran-Thanh, & Michalak (2016), "Repeated Dollar Auctions: A Multi-Armed Bandit Approach"** (AAMAS 2016) in the following directions:
 
-1. **Switching/dynamic regret** — replacing the evaluation benchmark from _static regret_ (single best fixed strategy over the whole horizon) with _switching regret_ (best strategy per phase), since an opponent can abruptly change behavioral regime due to _sunk-cost fallacy_.
-2. **Change-responsive algorithms** — comparing ELP (original baseline) against EXP3, EXP3.S, and EXP3.S + **Page-Hinkley test** as an explicit change-detection mechanism.
-3. **N-player extension** — generalizing from 2 players (Waniek et al.'s original setting) to a heterogeneous multi-player population.
-4. **External validation** — testing against real auction data (Swoopo penny-auction dataset) after validation on synthetic simulations.
+1. **Adaptive opponent** — Bob's regime transitions are driven by the agent's own recent bidding history (an aggressiveness signal built from past rounds), not a fixed schedule. This is what makes the adversarial-bandit framework's guarantees (which explicitly cover adaptive adversaries, per Poland 2005, cited in Waniek et al.'s footnote 2) actually necessary rather than merely convenient.
+2. **Switching/dynamic regret** — replacing the evaluation benchmark from *static regret* (single best fixed strategy over the whole horizon) with *switching regret* (best strategy per phase), since the opponent's regime can now change as an emergent consequence of the interaction itself.
+3. **Change-responsive algorithms** — comparing ELP (original baseline, with an explicitly flagged validity caveat under an adaptive opponent — see below) against EXP3, EXP3.S, and EXP3.S + **Page-Hinkley test** as an explicit change-detection mechanism.
+4. **N-player extension** — from 2 players to a heterogeneous multi-player population, where the "provocation" signal driving escalation can be aggregated across the whole population's interaction history.
+5. **Optional asymmetric-cost regret layer** — weighting "slow to detect escalation" more heavily than "false suspicion of a still-rational opponent," reflecting the asymmetric cost structure typical of security/detection domains (the motivating application area for this thesis).
+6. **External validation** — testing against real auction data (Swoopo penny-auction dataset) after validation on synthetic simulations.
 
 ---
 
-## 📁 Project Structure
+## 📁 project structure
 
 ```
 dollar-auction-bandit/
@@ -21,76 +36,93 @@ dollar-auction-bandit/
 ├── src/
 │   ├── environment/
 │   │   ├── __init__.py
-│   │   ├── dollar_auction.py          # 2-player auction rules (state, bidding turns, payoffs)
+│   │   ├── dollar_auction.py          # UNCHANGED by the adaptive pivot: still a pure
+│   │   │                                function of (agent_strategy, opponent_strategy).
+│   │   │                                It has no knowledge of whether the opponent is
+│   │   │                                adaptive -- that logic lives entirely in Bob.
 │   │   ├── dollar_auction_nplayer.py  # N-player version (Stage 2)
 │   │   └── strategies.py              # Definition of S0: the set of available strategies (arms)
 │   │
 │   ├── opponents/
 │   │   ├── __init__.py
-│   │   ├── alice_rational.py          # Rational agent (O'Neill threshold strategy)
-│   │   ├── bob_sunkcost.py            # Sunk-cost agent (single-switch & recurring)
-│   │   └── population.py              # Heterogeneous population generator (Stage 2)
+│   │   ├── alice_rational.py          # Rational agent (O'Neill threshold strategy) --
+│   │   │                                still fully stationary; serves as the control
+│   │   │                                baseline contrasting with adaptive Bob.
+│   │   ├── bob_sunkcost.py            # MAJOR REVISION: Bob now keeps cross-round state
+│   │   │                                (a rolling window of the agent's recent arm
+│   │   │                                choices) and probabilistically enters escalation
+│   │   │                                based on that history, instead of a fixed
+│   │   │                                switch_round/switch_points schedule.
+│   │   └── population.py              # Heterogeneous population generator (Stage 2);
+│   │                                    aggressiveness signal now aggregated across the
+│   │                                    whole population's interaction history.
 │   │
 │   ├── algorithms/
 │   │   ├── __init__.py
-│   │   ├── elp.py                     # ELP algorithm (Waniek et al.)
-│   │   ├── exp3.py                    # Base EXP3
+│   │   ├── base.py                    # Unchanged interface
+│   │   ├── elp.py                     # ELP (Waniek et al.) -- VALIDITY CAVEAT: Lemma-1
+│   │   │                                replay remains valid WITHIN a single round (Bob's
+│   │   │                                regime is fixed before that round's auction
+│   │   │                                starts), but is NOT valid for hindsight spanning
+│   │   │                                multiple rounds without a full re-simulation --
+│   │   │                                see design_decisions.md §14.
+│   │   ├── exp3.py                    # EXP3 -- unaffected by the pivot; its regret
+│   │   │                                guarantee already covers adaptive adversaries.
 │   │   ├── exp3s.py                   # EXP3.S (switching regret)
-│   │   └── page_hinkley.py            # Changepoint detector
+│   │   └── page_hinkley.py            # Changepoint detector -- role is now MORE central:
+│   │                                    it is also used post-hoc to check whether
+│   │                                    detected changepoints line up with the recorded
+│   │                                    (realized, not pre-fixed) true regime-switch times.
 │   │
 │   ├── metrics/
 │   │   ├── __init__.py
-│   │   ├── regret.py                  # Static regret & switching/dynamic regret
-│   │   └── detection_delay.py         # Measures Page-Hinkley detection speed
+│   │   ├── regret.py                  # Static regret & switching/dynamic regret --
+│   │   │                                dynamic regret's hindsight computation now
+│   │   │                                requires re-simulating each candidate phase-wide
+│   │   │                                strategy against a FRESH copy of Bob (so Bob
+│   │   │                                reacts naturally to that candidate strategy),
+│   │   │                                not a cheap replay of the original trace.
+│   │   └── detection_delay.py         # Measures Page-Hinkley detection speed relative
+│   │                                    to the REALIZED (recorded during simulation)
+│   │                                    regime-switch times, not a fixed constant.
 │   │
 │   └── simulation/
 │       ├── __init__.py
-│       ├── runner.py                  # Main loop: run T rounds, log results
-│       └── config.py                  # All parameters (T, γ, δ, λ, Bob proportion, etc.)
+│       ├── runner.py                  # Main loop -- now also calls
+│       │                                bob.observe_round_outcome(arm_played) AFTER each
+│       │                                round, and logs bob.current_regime() BEFORE each
+│       │                                round to build the realized ground-truth
+│       │                                regime-switch record.
+│       └── config.py                  # Parameters (T, gamma, delta, lambda, window size W
+│                                        for Bob's aggressiveness memory, etc.)
 │
 ├── experiments/
-│   ├── stage0_baseline_replication/   # ELP 2-player replication (validation)
-│   │   └── run_stage0.py
-│   ├── stage1a_single_switch/         # Bob switches once
-│   │   └── run_stage1a.py
-│   ├── stage1b_recurring_switch/      # Bob switches back and forth
-│   │   └── run_stage1b.py
+│   ├── stage0_baseline_replication/   # ELP 2-player replication vs Alice (stationary
+│   │                                    control) -- validation, unaffected by the pivot
+│   ├── stage1a_single_switch/         # RENAMED IN SPIRIT: opponent regime change is no
+│   │                                    longer a single fixed switch_round, but the
+│   │                                    first realized escalation episode -- retained as
+│   │                                    a simpler "mostly one episode" configuration
+│   ├── stage1b_recurring_switch/      # Opponent regime naturally oscillates as a
+│   │                                    consequence of ongoing interaction, not a
+│   │                                    pre-set switch_points list
 │   ├── stage2_nplayer/                # Heterogeneous N-player population
-│   │   └── run_stage2.py
 │   └── stage3_real_data/              # Swoopo dataset validation
-│       └── run_stage3.py
 │
-├── data/
-│   ├── raw/
-│   │   └── swoopo/                    # Original traces.tsv, outcomes.tsv (DO NOT modify)
-│   ├── processed/
-│   │   └── swoopo_cleaned.csv         # Preprocessed data ready for analysis
-│   └── synthetic/
-│       └── (optional, saved outputs from synthetic simulations)
-│
-├── results/
-│   ├── stage0/
-│   │   ├── figures/                   # Cumulative regret plots, etc.
-│   │   └── tables/                    # Summary numbers (CSV/JSON)
-│   ├── stage1a/
-│   ├── stage1b/
-│   ├── stage2/
-│   └── stage3/
-│
-├── notebooks/
-│   ├── 01_exploration_swoopo_data.ipynb
-│   ├── 02_sanity_check_elp.ipynb
-│   ├── 03_visualize_results.ipynb
-│   └── 04_sensitivity_analysis.ipynb
-│
+├── data/            (unchanged)
+├── results/         (unchanged)
+├── notebooks/       (unchanged)
 ├── tests/
 │   ├── test_environment.py
-│   ├── test_algorithms.py
-│   └── test_page_hinkley.py
+│   ├── test_opponents.py              # NEEDS NEW TESTS for Bob's adaptive regime logic
+│   │                                    (e.g. aggressive play history should raise
+│   │                                    escalation probability; a frozen/copied Bob used
+│   │                                    for hindsight must not mutate the original)
+│   └── test_algorithms.py
 │
 └── docs/
-    ├── design_decisions.md            # Log of design decisions (N-player rules, etc.)
-    └── notation.md                    # Notation glossary (following Table 1 in Waniek et al.)
+    ├── design_decisions.md            # See §13-18 for the full adaptive-pivot rationale
+    └── notation.md                    # See the new "Adaptive Bob" symbol table
 ```
 
 ---
@@ -117,7 +149,7 @@ Scripted/rule-based opponents, not learners (see the note in `docs/design_decisi
 
 The core contribution. All algorithms **must follow the same interface** (see "Interface Convention" below) so they can be swapped in `runner.py` without special-case code.
 
-- `elp.py` — ELP implementation (Algorithm 1 in Waniek et al.), leveraging the _prefix strategy_ structure for side-information.
+- `elp.py` — ELP implementation (Algorithm 1 in Waniek et al.), leveraging the *prefix strategy* structure for side-information.
 - `exp3.py` — base EXP3 (Auer et al. 2002), adversarial bandit baseline for static regret.
 - `exp3s.py` — EXP3.S (Auer et al. 2002, shifting/tracking variant), designed for switching regret.
 - `page_hinkley.py` — standalone changepoint detection module, designed to plug into EXP3.S as a reset trigger.
@@ -242,6 +274,8 @@ Agree on a seeding mechanism (e.g. explicit seed per run, logged in `config.py`)
 - Pull request + review before merging into `main`
 - Descriptive commit messages, referencing the relevant experiment stage
 
+**One addition specific to the pivot:** any function that computes a *hindsight* or *counterfactual* outcome against Bob (used for regret computation) **must** operate on a frozen/deep-copied snapshot of Bob's internal state, never the live Bob instance being updated by the real simulation loop. Mixing the two silently corrupts the regret calculation. Document any such snapshot logic clearly at the call site.
+
 ---
 
 ## 👥 Work Division (proposed)
@@ -256,14 +290,15 @@ Agree on a seeding mechanism (e.g. explicit seed per run, logged in `config.py`)
 
 ## 📚 Key References
 
-1. Waniek, M., Tran-Thanh, L., & Michalak, T. (2016). _Repeated Dollar Auctions: A Multi-Armed Bandit Approach._ AAMAS 2016.
-2. Auer, P., Cesa-Bianchi, N., Freund, Y., & Schapire, R. E. (2002). _The Nonstochastic Multiarmed Bandit Problem._ SIAM Journal on Computing, 32(1). (Source of EXP3 & EXP3.S)
-3. Mannor, S., & Shamir, O. (2011). _From Bandits to Experts: On the Value of Side-Observations._ NeurIPS. (Foundation of the ELP algorithm)
-4. Besbes, O., Gur, Y., & Zeevi, A. (2014). _Stochastic Multi-Armed-Bandit Problem with Non-stationary Rewards._ NeurIPS.
-5. Garivier, A., & Moulines, E. (2011). _On Upper-Confidence Bound Policies for Switching Bandit Problems._
-6. O'Neill, B. (1986). _International Escalation and the Dollar Auction._ Journal of Conflict Resolution, 30(1).
-7. Augenblick, N. (2015). _The Sunk-Cost Fallacy in Penny Auctions._ (Source of Swoopo data validation)
-8. Byers, J., Mitzenmacher, M., & Zervas, G. (2010). _Information Asymmetries in Pay-Per-Bid Auctions: How Swoopo Makes Bank._ (Source of the Swoopo dataset)
+1. Waniek, M., Tran-Thanh, L., & Michalak, T. (2016). *Repeated Dollar Auctions: A Multi-Armed Bandit Approach.* AAMAS 2016.
+2. Auer, P., Cesa-Bianchi, N., Freund, Y., & Schapire, R. E. (2002). *The Nonstochastic Multiarmed Bandit Problem.* SIAM Journal on Computing, 32(1). (Source of EXP3 & EXP3.S)
+3. Mannor, S., & Shamir, O. (2011). *From Bandits to Experts: On the Value of Side-Observations.* NeurIPS. (Foundation of the ELP algorithm)
+4. Besbes, O., Gur, Y., & Zeevi, A. (2014). *Stochastic Multi-Armed-Bandit Problem with Non-stationary Rewards.* NeurIPS.
+5. Garivier, A., & Moulines, E. (2011). *On Upper-Confidence Bound Policies for Switching Bandit Problems.*
+6. O'Neill, B. (1986). *International Escalation and the Dollar Auction.* Journal of Conflict Resolution, 30(1).
+7. Augenblick, N. (2015). *The Sunk-Cost Fallacy in Penny Auctions.* (Source of Swoopo data validation)
+8. Byers, J., Mitzenmacher, M., & Zervas, G. (2010). *Information Asymmetries in Pay-Per-Bid Auctions: How Swoopo Makes Bank.* (Source of the Swoopo dataset)
+9. Poland, J. (2005). *FPL analysis for adaptive bandits.* 3rd Symposium on Stochastic Algorithms, Foundations and Applications (SAGA'05). — cited by Waniek et al. (footnote 2) as the argument extending the Mannor–Shamir regret proof to adaptive adversaries; central to justifying the adaptive-Bob design.
 
 ---
 
