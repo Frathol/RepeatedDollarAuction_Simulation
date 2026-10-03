@@ -5,3 +5,6 @@ seaborn
 scipy
 pytest
 jupyter
+tqdm
+mesa
+SMPyBandits
