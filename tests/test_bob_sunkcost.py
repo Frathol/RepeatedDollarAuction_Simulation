@@ -107,3 +107,70 @@ def test_escalation_bids_beyond_rational_fold():
     raised = [strat(9, 8) for _ in range(500)]
     assert any(v == 9 for v in raised)     # sometimes continues past fold
     assert any(v == 8 for v in raised)     # sometimes folds
+
+
+# ---- min_history / fixed_regime / prior_sunk_cost ------------------------
+
+def test_default_waits_for_a_full_window():
+    bob = _bob(seed=10, window=10)
+    for _ in range(9):
+        bob.observe_agent_move(1.0)
+    assert bob.p_escalate() == 0.0
+    assert bob.begin_round() is False
+    bob.observe_agent_move(1.0)               # window now full
+    assert bob.p_escalate() == 1.0
+
+
+def test_min_history_one_reacts_immediately():
+    bob = _bob(seed=11, window=10, min_history=1)
+    bob.observe_agent_move(1.0)
+    assert bob.p_escalate() == 1.0
+
+
+def test_min_history_must_fit_window():
+    for bad in (0, 11):
+        try:
+            _bob(window=10, min_history=bad)
+        except ValueError:
+            continue
+        raise AssertionError("expected ValueError")
+
+
+def test_fixed_regime_pins_the_regime():
+    esc = _bob(seed=12, fixed_regime=True)
+    rat = _bob(seed=12, window=5, fixed_regime=False)
+    for _ in range(5):
+        rat.observe_agent_move(1.0)           # would normally force escalation
+    assert all(esc.begin_round() for _ in range(20))
+    assert not any(rat.begin_round() for _ in range(20))
+
+
+def _contest_bob(prior):
+    return Bob(stake=8.0, budget=12, mu=0.5, sunk_cost_threshold=0.5,
+               prior_sunk_cost=prior, escalation_rate=50.0,
+               escalation_ceiling=12.0, fixed_regime=True,
+               rng=np.random.default_rng(0))
+
+
+def test_prior_sunk_cost_makes_bob_contest_an_opening():
+    # fold threshold = 0.5 * 8 = 4; the learner opened with 5.
+    plain = _contest_bob(prior=0.0)
+    plain.begin_round()
+    assert plain.get_strategy()(0, 5) == 5     # not yet hooked -> folds
+    hooked = _contest_bob(prior=3.0)
+    hooked.begin_round()
+    assert hooked.get_strategy()(0, 5) == 6    # arrives invested -> raises
+
+
+def test_prior_sunk_cost_bob_still_opens_when_first():
+    bob = _contest_bob(prior=3.0)
+    bob.begin_round()
+    assert bob.get_strategy()(0, 0) == 1       # never "skips" the auction
+
+
+def test_negative_prior_sunk_cost_raises():
+    try:
+        Bob(stake=8.0, budget=12, prior_sunk_cost=-1.0)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")

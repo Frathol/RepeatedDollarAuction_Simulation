@@ -220,9 +220,12 @@ def make_simulation(
     bob = Bob(
         stake=cfg.stake, budget=cfg.budget, mu=cfg.bob_mu,
         sunk_cost_threshold=cfg.bob_sunk_cost_threshold,
+        prior_sunk_cost=cfg.bob_prior_sunk_cost,
         escalation_rate=cfg.bob_escalation_rate,
         window=cfg.bob_window, escalation_gain=cfg.bob_gain,
-        min_dwell=cfg.bob_min_dwell, rng=bob_rng,
+        min_dwell=cfg.bob_min_dwell, min_history=cfg.bob_min_history,
+        fixed_regime=cfg.bob_fixed_regime,
+        escalation_ceiling=cfg.bob_escalation_ceiling, rng=bob_rng,
     )
     detector = None
     if use_ph:
@@ -242,12 +245,14 @@ def make_simulation(
 # was authored in (Mesa unavailable there). The core above is tested; if the
 # wrapper raises, the likely culprits are listed in the README of this change.
 
+_MESA_IMPORT_ERROR = None
 try:
     from mesa import Agent as _MesaAgent, Model as _MesaModel
     from mesa.datacollection import DataCollector as _DataCollector
     _HAS_MESA = True
-except ImportError:  # pragma: no cover
+except ImportError as _err:  # pragma: no cover
     _HAS_MESA = False
+    _MESA_IMPORT_ERROR = _err   # keep the REAL reason (not installed vs. broken)
 
 if _HAS_MESA:
 
@@ -307,7 +312,12 @@ def run_with_mesa(
 ):
     """Run via Mesa and return (model, model_df, agent_df)."""
     if not _HAS_MESA:
-        raise ImportError("mesa is not installed: pip install 'mesa>=3.0'")
+        raise ImportError(
+            "Mesa could not be imported (see the chained error below for the "
+            "real cause). Check: `pip show mesa` inside the active .venv; if "
+            "it is missing run `pip install \"mesa>=3.0\"`; if the install or "
+            "import fails, try a venv built with Python 3.12/3.13."
+        ) from _MESA_IMPORT_ERROR
     sim = make_simulation(cfg, algorithm=algorithm, use_ph=use_ph)
     model = AuctionModel(sim)
     it = range(cfg.T)

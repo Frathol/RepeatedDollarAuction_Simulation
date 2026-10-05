@@ -74,6 +74,16 @@ class Bob:
         threshold, otherwise Bob can never reach it and escalation is
         silently a no-op (e.g. stake=5, mu=0.8 -> fold at 4 < old default
         threshold 5.0).
+    prior_sunk_cost : float
+        Investment Bob ALREADY has when the auction starts (e.g. compute
+        progress of a job that was running before). Added to his own bid
+        when deciding whether he is "hooked": effective sunk cost =
+        x + prior_sunk_cost. Default 0 = original behaviour. Without it
+        Bob only becomes hooked after HE has bid, so when the learner opens
+        the auction Bob folds like a rational player and escalation can
+        only matter in the ~half of rounds where Bob starts. When > 0, Bob
+        still always opens if asked to move first (a hooked Bob never
+        "skips" an auction).
     escalation_rate : float
         Rate of the within-auction curve p_continue = 1 - exp(-rate*(x-thr)).
         (Unchanged from the previous version; note p_continue = 0 exactly
@@ -89,6 +99,17 @@ class Bob:
         theta/budget and gain=1 this is sec. 13's min(1, mean_theta/budget).
     min_dwell : int
         Minimum number of rounds a drawn regime is held (see module doc).
+    min_history : int, optional
+        Bob does not react (p_escalate = 0) until his window holds at least
+        this many observations. Default None = `window`, i.e. he waits for
+        a FULL window. (With min_history=1 a single early observation can
+        already give p_escalate = 1, which is how the first smoke run showed
+        P_Escalate=1.0 at round 2.)
+    fixed_regime : bool, optional
+        None (default) = adaptive Bob. True/False pins the regime to
+        Escalating/Rational forever (an "oracle" Bob). Used by calibration
+        and sweeps to measure each regime in isolation; never in the real
+        experiments.
     rng : numpy.random.Generator, optional
         Bob's PRIVATE generator. Do not share it with the agent, the
         environment, or any hindsight code.
@@ -101,15 +122,22 @@ class Bob:
         increment: int = 1,
         mu: float = 0.8,
         sunk_cost_threshold: Optional[float] = None,
+        prior_sunk_cost: float = 0.0,
         escalation_rate: float = 0.5,
         escalation_ceiling: Optional[float] = None,
         window: int = 50,
         escalation_gain: float = 1.0,
         min_dwell: int = 1,
+        min_history: Optional[int] = None,
+        fixed_regime: Optional[bool] = None,
         rng=None,
     ) -> None:
         if window < 1:
             raise ValueError("window must be >= 1")
+        if min_history is None:
+            min_history = window
+        if not (1 <= min_history <= window):
+            raise ValueError("min_history must be in [1, window]")
         if min_dwell < 1:
             raise ValueError("min_dwell must be >= 1")
 
@@ -146,10 +174,15 @@ class Bob:
             )
         self.escalation_ceiling = escalation_ceiling
 
+        if prior_sunk_cost < 0:
+            raise ValueError("prior_sunk_cost must be >= 0")
+        self.prior_sunk_cost = prior_sunk_cost
         self.escalation_rate = escalation_rate
         self.window = window
         self.escalation_gain = escalation_gain
         self.min_dwell = min_dwell
+        self.min_history = min_history
+        self.fixed_regime = fixed_regime
         self.rng = rng if rng is not None else np.random.default_rng()
 
         self._window: Deque[float] = deque(maxlen=window)
@@ -168,6 +201,8 @@ class Bob:
 
     def p_escalate(self) -> float:
         """Probability of entering/holding escalation, from history only."""
+        if len(self._window) < self.min_history:
+            return 0.0
         return min(1.0, max(0.0, self.escalation_gain * self.aggressiveness_score()))
 
     def begin_round(self) -> bool:
@@ -176,6 +211,9 @@ class Bob:
         Call exactly once per round, BEFORE get_strategy(). Returns True
         if escalating.
         """
+        if self.fixed_regime is not None:
+            self._escalating = bool(self.fixed_regime)
+            return self._escalating
         if self._dwell_left > 0:
             self._dwell_left -= 1
         else:
@@ -215,8 +253,11 @@ class Bob:
 
         def strategy(x: int, y: int) -> int:
             next_bid = y + self.increment
+            sunk = x + self.prior_sunk_cost
+            opening = (x == 0 and y == 0)       # Bob is asked to move first
 
-            if (not escalating) or x < self.sunk_cost_threshold:
+            if ((not escalating) or sunk < self.sunk_cost_threshold
+                    or (opening and self.prior_sunk_cost > 0)):
                 if next_bid > self.fold_threshold or next_bid > self.budget:
                     return y
                 return next_bid
@@ -225,7 +266,7 @@ class Bob:
                 return y
 
             p_continue = 1.0 - math.exp(
-                -self.escalation_rate * (x - self.sunk_cost_threshold)
+                -self.escalation_rate * (sunk - self.sunk_cost_threshold)
             )
             if self.rng.random() < p_continue:
                 return next_bid

@@ -1,67 +1,55 @@
 """
-calibrate_regimes.py  --  run BEFORE Stage 1a/1b.
+calibrate_regimes.py  --  run BEFORE Stage 1 (and again whenever Bob changes).
 
-For a given (budget, stake, Bob params), play every threshold arm theta
-FIXED against (a) an always-rational Bob and (b) an always-escalating Bob
-and print the mean reward per arm. Stage 1 only makes sense if the best arm
-DIFFERS between the two regimes (otherwise there is nothing for EXP3.S /
-Page-Hinkley to track). If both rows show the same best theta and nearly
-identical rewards, retune Bob / budget / stake.
+For each configuration: pin Bob to Rational and to Escalating, play every
+threshold arm theta FIXED, print the mean reward per arm and the separation
+score (see src/simulation/calibration.py). Stage 1 only makes sense if the
+best arm differs between regimes and using the wrong one is costly.
 
-Run from the project root:
+The control row "old Bob" (prior_sunk_cost = 0) shows why prior_sunk_cost
+was introduced: without it Bob only gets hooked after HE bids, so when the
+learner opens the auction he folds like a rational player and escalation can
+only matter in the rounds where Bob starts -> a much weaker regime effect.
+
+For a systematic search use experiments/sweep_bob.py.
+
     python -m experiments.calibrate_regimes
 """
+import sys
+import warnings
+from pathlib import Path
+
 import numpy as np
 
-from src.algorithms.base import BanditAlgorithm
-from src.simulation.config import SimConfig
-from src.simulation.runner import make_simulation
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-GRID = [  # (budget, stake, bob_sunk_cost_threshold)
-    (12, 10.0, None),
-    (12, 5.0, None),
-    (12, 5.0, 0.5),
-    (8, 10.0, None),
+from src.simulation.calibration import arm_rewards, opening_bid, separation_score
+
+T, SEEDS = 600, 4
+
+# (label, budget, stake, bob kwargs)
+def bob(mu=0.5, prior=3.0, rate=3.0, thr=0.5):
+    return dict(mu=mu, sunk_cost_threshold=thr, prior_sunk_cost=prior,
+                escalation_rate=rate)
+
+CONFIGS = [
+    ("RECOMMENDED  b=12 s=8  (prior_sunk_cost=3)", 12, 8.0, bob()),
+    ("alt          b=14 s=10 (prior_sunk_cost=3)", 14, 10.0, bob()),
+    ("control: old Bob (prior_sunk_cost=0), b=12 s=8", 12, 8.0, bob(prior=0.0)),
+    ("control: Stage-0 style b=12 s=5, mu=0.8, prior=0", 12, 5.0, bob(mu=0.8, prior=0.0, thr=0.5)),
+    ("control: b=12 s=10, mu=0.8, prior=3", 12, 10.0, bob(mu=0.8, prior=3.0)),
 ]
-T, SEEDS, BURN = 800, 3, 50
-
-
-class FixedArm(BanditAlgorithm):
-    def __init__(self, n, arm):
-        super().__init__(n)
-        self.arm = arm
-
-    def select_arm(self):
-        return self.arm
-
-    def update(self, arm, reward, info=None):
-        pass
-
-
-def arm_rewards(budget, stake, thr, gain):
-    out = []
-    for th in range(budget + 1):
-        vals = []
-        for seed in range(SEEDS):
-            cfg = SimConfig(budget=budget, stake=stake, T=T, seed=seed,
-                            bob_gain=gain, bob_sunk_cost_threshold=thr)
-            sim = make_simulation(cfg, FixedArm(budget + 1, th))
-            sim.run()
-            vals.append(np.mean([r["reward"] for r in sim.records[BURN:]]))
-        out.append(np.mean(vals))
-    return np.array(out)
-
 
 if __name__ == "__main__":
-    for budget, stake, thr in GRID:
-        print(f"\n=== budget={budget} stake={stake} sunk_cost_thr={thr} ===")
-        rows = {}
-        for label, gain in (("rational", 0.0), ("escalating", 100.0)):
-            r = arm_rewards(budget, stake, thr, gain)
-            rows[label] = r
-            print(f"  {label:10s} best theta={r.argmax():2d}  "
-                  f"{np.round(r, 2).tolist()}")
-        same = rows["rational"].argmax() == rows["escalating"].argmax()
-        gap = np.abs(rows["rational"] - rows["escalating"]).max()
-        print(f"  -> best arm differs between regimes: {not same} | "
-              f"max reward gap: {gap:.3f}")
+    warnings.simplefilter("ignore")
+    for label, b, s, kw in CONFIGS:
+        kw = dict(kw, escalation_ceiling=float(b))
+        rr = arm_rewards(b, s, kw, False, T=T, seeds=SEEDS)
+        re = arm_rewards(b, s, kw, True, T=T, seeds=SEEDS)
+        sc = separation_score(rr, re)
+        print(f"\n=== {label} | x0={opening_bid(b, s)} ===")
+        print(f"  rational   {np.round(rr, 2).tolist()}")
+        print(f"  escalating {np.round(re, 2).tolist()}")
+        print(f"  best arms: rational={sc['best_rational']}  escalating={sc['best_escalating']}")
+        print(f"  cross-regime loss A={sc['A']:.3f} B={sc['B']:.3f}  ->  score={sc['score']:.3f}"
+              f"  {'OK' if sc['score'] >= 0.10 else 'too weak for Stage 1'}")
