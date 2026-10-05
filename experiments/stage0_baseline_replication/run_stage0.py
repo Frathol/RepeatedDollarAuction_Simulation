@@ -1,83 +1,68 @@
 """
 run_stage0.py
 
-Stage 0 -- Baseline Replication (detailed version).
+Stage 0 -- Baseline replication: ELP vs. the rational, oblivious opponent
+(Alice) in Waniek et al.'s setting, static regret against the best fixed
+threshold arm in hindsight.
 
-Adds, on top of the first version:
-    - `winner` recorded every round (who actually won that auction)
-    - a rolling MOVING AVERAGE of reward (see explanation below)
-    - regret reported at several horizon CHECKPOINTS (not just the
-      final T), so you can see how fast it grows early vs late
-    - support for running SEVERAL PARAMETER CONFIGURATIONS in one
-      go, each saved to its OWN subfolder (so results never get mixed
-      together), plus one combined comparison plot overlaying all
-      configs' mean regret curves side by side.
+This script is STANDALONE (own loop, no runner.py / Mesa): the opponent is
+oblivious, so per-round counterfactuals ("what would arm g have earned this
+round") are valid and cheap. It is the BASELINE for all later stages:
+figures are produced by the shared `src/metrics/plots.py`, so later stages
+produce the same set and only add layers on top.
 
-WHY A MOVING AVERAGE, SPECIFICALLY:
-    Cumulative regret (and cumulative reward) can only ever go up (or
-    plateau) -- it accumulates the ENTIRE history, so it can never
-    "recover" or show you the algorithm's CURRENT, local behavior. A
-    moving average of the raw per-round reward, in contrast, only
-    looks at the last W rounds (e.g. W=50) and re-averages them at
-    every step. This answers a different, complementary question:
-    "how well is the algorithm doing RIGHT NOW, ignoring old history?"
-    It's the difference between "what's my bank balance" (cumulative)
-    and "what's my average daily spending this month" (moving
-    average). For Stage 0 specifically, the moving average should
-    settle into a fairly flat, stable band once ELP has mostly learned
-    to avoid theta=0 -- and later, in Stage 1 (Bob), it is THE key
-    diagnostic for visually spotting the exact round where performance
-    drops after a regime switch and how many rounds it takes to
-    recover, which cumulative regret alone hides.
+Outputs per configuration (results/stage0/<label>/):
+    tables/raw_results.csv         one row per (seed, round)
+    tables/checkpoint_regret.csv   regret at fractions of T (mean/std over seeds)
+    tables/summary.csv             final selection prob + hindsight reward per theta
+    figures/*.png                  standard set (see plots.py) incl. regret_vs_bound
+results/stage0/comparison_regret.png, comparison_reward.png
 
-Run from the project root:
-    python3 -m experiments.stage0_baseline_replication.run_stage0
+Run from the project root (folder name = whatever yours is called):
+    python -m experiments.stage0_baseline_replication.run_stage0
+    python -m experiments.stage0_baseline_replication.run_stage0 --quick
 """
 
 from __future__ import annotations
 
+import argparse
 import csv
+import math
 import sys
 from pathlib import Path
 
 import numpy as np
 
+import matplotlib
+matplotlib.use("Agg")
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.algorithms.elp import ELP
 from src.environment.dollar_auction import DollarAuction
 from src.environment.strategies import build_threshold_arm_set
+from src.metrics.plots import (RunBundle, moving_average, plot_comparison,
+                               save_fig, save_standard_report)
 from src.opponents.alice_rational import Alice
-from src.algorithms.elp import ELP
+
+try:                                    # progress bars are optional
+    from tqdm import tqdm
+except ImportError:                     # pragma: no cover
+    def tqdm(it=None, **kwargs):
+        return it
+    tqdm.write = print
 
 
-# ---------------------------------------------------------------------
-# Experiment configurations -- add/remove entries here to compare
-# different parameter regimes. Each gets its own output subfolder.
-# ---------------------------------------------------------------------
 CONFIGS = [
-    {
-        "label": "budget12_stake5",
-        "budget": 12,
-        "stake": 5.0,
-        "alice_mu": 0.8,
-        "T": 10000,
-        "n_seeds": 8,
-    },
-    {
-        "label": "budget8_stake10",
-        "budget": 8,
-        "stake": 10.0,
-        "alice_mu": 0.8,
-        "T": 10000,
-        "n_seeds": 8,
-    },
+    {"label": "budget12_stake5", "budget": 12, "stake": 5.0,
+     "alice_mu": 0.8, "T": 10000, "n_seeds": 8},
+    {"label": "budget8_stake10", "budget": 8, "stake": 10.0,
+     "alice_mu": 0.8, "T": 10000, "n_seeds": 8},
 ]
 
 MOVING_AVG_WINDOW = 50
-CHECKPOINTS_FRACTIONS = [0.1, 0.25, 0.5, 0.75, 1.0]  # as fraction of T
-
-OUTPUT_ROOT = PROJECT_ROOT / "results" / "stage0"
+CHECKPOINT_FRACTIONS = [0.1, 0.25, 0.5, 0.75, 1.0]
 
 
 def run_single_seed(cfg: dict, seed: int) -> dict:
@@ -90,258 +75,173 @@ def run_single_seed(cfg: dict, seed: int) -> dict:
 
     env = DollarAuction(stake=stake, budget=budget)
     alice_strategy = Alice(stake=stake, budget=budget, mu=alice_mu).get_strategy()
+    elp = ELP(strategies=arms, thetas=thetas, stake=stake, budget=budget,
+              horizon_T=T, rng=rng)
 
-    elp = ELP(
-        strategies=arms, thetas=thetas, stake=stake, budget=budget,
-        horizon_T=T, rng=rng,
-    )
-
-    hindsight_sums = [0.0] * n_arms
+    hindsight_sums = np.zeros(n_arms)
     realized_sum = 0.0
-    rows = []
-    recent_rewards: list = []
 
-    for t in range(1, T + 1):
+    reward = np.zeros(T)
+    regret = np.zeros(T)
+    arm_theta = np.zeros(T, dtype=int)
+    agent_won = np.zeros(T, dtype=bool)
+    agent_bid = np.zeros(T)
+    opp_bid = np.zeros(T)
+
+    for t in tqdm(range(T), desc=f"  seed {seed} rounds", leave=False):
         agent_starts = bool(rng.integers(0, 2))
 
         arm = elp.select_arm()
-        result = env.run(arms[arm], alice_strategy, agent_starts=agent_starts, rng=rng)
-        reward = DollarAuction.normalize_reward(result.agent_payoff, budget, stake)
-        elp.update(arm, reward, info={"agent_state_trace": result.agent_state_trace})
-        realized_sum += reward
+        result = env.run(arms[arm], alice_strategy,
+                         agent_starts=agent_starts, rng=rng)
+        r = DollarAuction.normalize_reward(result.agent_payoff, budget, stake)
+        elp.update(arm, r, info={"agent_state_trace": result.agent_state_trace})
+        realized_sum += r
 
+        # Hindsight: valid here because Alice is oblivious (her behaviour
+        # does not depend on the learner's past play).
         for i, s in enumerate(arms):
             r_i = env.run(s, alice_strategy, agent_starts=agent_starts, rng=rng)
-            hindsight_sums[i] += DollarAuction.normalize_reward(r_i.agent_payoff, budget, stake)
+            hindsight_sums[i] += DollarAuction.normalize_reward(
+                r_i.agent_payoff, budget, stake)
 
-        best_hindsight = max(hindsight_sums)
-        static_regret = best_hindsight - realized_sum
-
-        recent_rewards.append(reward)
-        if len(recent_rewards) > MOVING_AVG_WINDOW:
-            recent_rewards.pop(0)
-        moving_avg_reward = float(np.mean(recent_rewards))
-
-        rows.append({
-            "seed": seed,
-            "round": t,
-            "arm_theta": thetas[arm],
-            "winner": result.winner,
-            "agent_final_bid": result.agent_final_bid,
-            "opponent_final_bid": result.opponent_final_bid,
-            "reward": reward,
-            "moving_avg_reward": moving_avg_reward,
-            "cumulative_reward": realized_sum,
-            "static_regret": static_regret,
-        })
-
-    checkpoints = sorted(set(max(1, int(round(f * T))) for f in CHECKPOINTS_FRACTIONS))
-    checkpoint_regret = {c: rows[c - 1]["static_regret"] for c in checkpoints}
-
-    win_count = sum(1 for r in rows if r["winner"] == "agent")
+        reward[t] = r
+        regret[t] = hindsight_sums.max() - realized_sum
+        arm_theta[t] = thetas[arm]
+        agent_won[t] = result.winner == "agent"
+        agent_bid[t] = result.agent_final_bid
+        opp_bid[t] = result.opponent_final_bid
 
     return {
-        "rows": rows,
-        "final_probs": dict(zip(thetas, elp._last_probs)),
-        "final_regret": rows[-1]["static_regret"],
-        "checkpoint_regret": checkpoint_regret,
-        "win_rate": win_count / T,
+        "reward": reward, "regret": regret, "arm_theta": arm_theta,
+        "agent_won": agent_won, "agent_bid": agent_bid, "opp_bid": opp_bid,
+        "final_probs": np.array(elp._last_probs),
+        "hindsight": hindsight_sums,
+        "elp_beta": elp.beta, "elp_epsilon": getattr(elp, "epsilon", None),
+        "n_arms": n_arms,
     }
 
 
-def run_config(cfg: dict) -> dict:
-    label = cfg["label"]
-    n_seeds = cfg["n_seeds"]
-    T = cfg["T"]
+def theorem6_bound(T: int, n_arms: int, beta: float, epsilon: float) -> np.ndarray:
+    """
+    Upper bound on ELP's regret for the threshold family (alpha(G)=1), for
+    the beta actually used (Theorem 6 / Thm 2 with alpha = 1):
 
-    out_dir = OUTPUT_ROOT / label
-    (out_dir / "figures").mkdir(parents=True, exist_ok=True)
+        U(t) <= 9 * beta * t * log(6|S0| / eps) + log|S0| / beta
+
+    Valid for every t simultaneously because beta is fixed. Normalized
+    rewards in [0,1], so the units match our regret.
+    """
+    t = np.arange(1, T + 1)
+    return 9.0 * beta * t * math.log(6 * n_arms / epsilon) + math.log(n_arms) / beta
+
+
+def run_config(cfg: dict, out_root: Path) -> RunBundle:
+    label, n_seeds, T = cfg["label"], cfg["n_seeds"], cfg["T"]
+    out_dir = out_root / label
     (out_dir / "tables").mkdir(parents=True, exist_ok=True)
 
-    print(f"\n=== Config '{label}' (budget={cfg['budget']}, stake={cfg['stake']}) ===")
+    tqdm.write(f"\n=== Config '{label}' (budget={cfg['budget']}, "
+               f"stake={cfg['stake']}, T={T}, seeds={n_seeds}) ===")
 
-    all_rows = []
-    final_probs_per_seed = []
-    final_regrets = []
-    win_rates = []
-    checkpoint_regrets_per_seed = []
+    runs = []
+    for seed in tqdm(range(n_seeds), desc=label):
+        res = run_single_seed(cfg, seed)
+        runs.append(res)
+        tqdm.write(f"  seed={seed:2d}  final regret={res['regret'][-1]:.3f}  "
+                   f"win_rate={res['agent_won'].mean():.3f}")
 
-    for seed in range(n_seeds):
-        result = run_single_seed(cfg, seed)
-        all_rows.extend(result["rows"])
-        final_probs_per_seed.append(result["final_probs"])
-        final_regrets.append(result["final_regret"])
-        win_rates.append(result["win_rate"])
-        checkpoint_regrets_per_seed.append(result["checkpoint_regret"])
-        print(f"  seed={seed:2d}  final regret={result['final_regret']:.3f}  "
-              f"win_rate={result['win_rate']:.3f}")
+    stack = lambda k: np.stack([r[k] for r in runs])
+    thetas = list(range(0, cfg["budget"] + 1))
 
-    # --- Raw per-round CSV ---
+    bound = None
+    eps = runs[0]["elp_epsilon"]
+    if eps:
+        bound = theorem6_bound(T, runs[0]["n_arms"], runs[0]["elp_beta"], eps)
+
+    bundle = RunBundle(
+        label=label, thetas=thetas,
+        reward=stack("reward"), regret=stack("regret"),
+        arm_theta=stack("arm_theta"), agent_won=stack("agent_won"),
+        agent_bid=stack("agent_bid"), opp_bid=stack("opp_bid"),
+        final_probs=stack("final_probs"), hindsight_per_arm=stack("hindsight"),
+        regret_name="static regret", bound=bound,
+    )
+
+    # ---- raw per-round CSV (same columns as before) --------------------
+    ma = moving_average(bundle.reward, MOVING_AVG_WINDOW)
+    cum_reward = np.cumsum(bundle.reward, axis=1)
     raw_path = out_dir / "tables" / "raw_results.csv"
     with open(raw_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(all_rows)
+        w = csv.writer(f)
+        w.writerow(["seed", "round", "arm_theta", "winner", "agent_final_bid",
+                    "opponent_final_bid", "reward", "moving_avg_reward",
+                    "cumulative_reward", "static_regret"])
+        for s in range(n_seeds):
+            for t in range(T):
+                w.writerow([s, t + 1, bundle.arm_theta[s, t],
+                            "agent" if bundle.agent_won[s, t] else "opponent",
+                            bundle.agent_bid[s, t], bundle.opp_bid[s, t],
+                            bundle.reward[s, t], ma[s, t], cum_reward[s, t],
+                            bundle.regret[s, t]])
 
-    # --- Checkpoint regret table (mean +/- std across seeds) ---
-    checkpoints = sorted(checkpoint_regrets_per_seed[0].keys())
-    checkpoint_path = out_dir / "tables" / "checkpoint_regret.csv"
-    with open(checkpoint_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["round_t", "mean_static_regret", "std_static_regret"])
+    # ---- checkpoint regret ---------------------------------------------
+    checkpoints = sorted({max(1, int(round(fr * T))) for fr in CHECKPOINT_FRACTIONS})
+    with open(out_dir / "tables" / "checkpoint_regret.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["round_t", "mean_static_regret", "std_static_regret",
+                    "theoretical_bound"])
         for c in checkpoints:
-            vals = [d[c] for d in checkpoint_regrets_per_seed]
-            writer.writerow([c, float(np.mean(vals)), float(np.std(vals))])
+            vals = bundle.regret[:, c - 1]
+            w.writerow([c, float(vals.mean()), float(vals.std()),
+                        float(bound[c - 1]) if bound is not None else ""])
 
-    # --- Final selection probability summary ---
-    thetas = sorted(final_probs_per_seed[0].keys())
-    summary_path = out_dir / "tables" / "summary.csv"
-    with open(summary_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["theta", "mean_final_selection_prob", "std_final_selection_prob"])
-        for th in thetas:
-            vals = [p[th] for p in final_probs_per_seed]
-            writer.writerow([th, float(np.mean(vals)), float(np.std(vals))])
+    # ---- per-theta summary ---------------------------------------------
+    with open(out_dir / "tables" / "summary.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["theta", "mean_final_selection_prob", "std_final_selection_prob",
+                    "mean_hindsight_reward_per_round"])
+        for i, th in enumerate(thetas):
+            w.writerow([th, float(bundle.final_probs[:, i].mean()),
+                        float(bundle.final_probs[:, i].std()),
+                        float(bundle.hindsight_per_arm[:, i].mean() / T)])
 
-    mean_regret = float(np.mean(final_regrets))
-    std_regret = float(np.std(final_regrets))
-    mean_win_rate = float(np.mean(win_rates))
-
-    print(f"  --> final regret: mean={mean_regret:.3f} std={std_regret:.3f}  "
-          f"mean win_rate={mean_win_rate:.3f}")
-    print(f"  Checkpoint regret (mean across seeds):")
+    tqdm.write(f"  --> final regret: mean={bundle.regret[:, -1].mean():.3f} "
+               f"std={bundle.regret[:, -1].std():.3f}  "
+               f"win_rate={bundle.agent_won.mean():.3f}")
+    if bound is not None:
+        tqdm.write(f"      theoretical bound at T: {bound[-1]:.1f}")
     for c in checkpoints:
-        vals = [d[c] for d in checkpoint_regrets_per_seed]
-        print(f"    t={c:5d}: {np.mean(vals):.3f}")
+        tqdm.write(f"    t={c:5d}: regret={bundle.regret[:, c - 1].mean():.3f}")
 
-    # --- Build regret matrix + moving-avg-reward matrix for plotting ---
-    regret_matrix = np.zeros((n_seeds, T))
-    moving_avg_matrix = np.zeros((n_seeds, T))
-    for seed in range(n_seeds):
-        seed_rows = [r for r in all_rows if r["seed"] == seed]
-        regret_matrix[seed, :] = [r["static_regret"] for r in seed_rows]
-        moving_avg_matrix[seed, :] = [r["moving_avg_reward"] for r in seed_rows]
-
-    return {
-        "label": label,
-        "out_dir": out_dir,
-        "regret_matrix": regret_matrix,
-        "moving_avg_matrix": moving_avg_matrix,
-        "T": T,
-        "thetas": thetas,
-        "final_probs_per_seed": final_probs_per_seed,
-    }
-
-
-def make_individual_plot(config_result: dict):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import MaxNLocator
-
-    label = config_result["label"]
-    T = config_result["T"]
-    rounds = np.arange(1, T + 1)
-    regret_matrix = config_result["regret_matrix"]
-    moving_avg_matrix = config_result["moving_avg_matrix"]
-
-    marker_spacing = max(1, T // 10) 
-
-    # --- Figure 1: cumulative static regret ---
-    fig1, ax1 = plt.subplots(figsize=(8, 5))
-    mean_regret = regret_matrix.mean(axis=0)
-    std_regret = regret_matrix.std(axis=0)
-    
-    ax1.plot(rounds, mean_regret, color="#2A6F77", label="mean static regret", 
-             marker='|', markevery=marker_spacing, markersize=8)
-    
-    ax1.fill_between(rounds, mean_regret - std_regret, mean_regret + std_regret,
-                      alpha=0.2, color="#2A6F77", label="±1 std across seeds")
-    
-    ax1.yaxis.set_major_locator(MaxNLocator(10))
-    
-    ax1.set_xlabel("Round (t)  ->  1 to T, one full auction per round")
-    ax1.set_ylabel("Cumulative static regret  U_A(T)\n(higher = worse; accumulates over all rounds so far)")
-    ax1.set_title(f"Stage 0 [{label}]: cumulative static regret")
-    ax1.legend()
-    fig1.tight_layout()
-    regret_path = config_result["out_dir"] / "figures" / "regret_cumulative.png"
-    fig1.savefig(regret_path, dpi=150)
-    plt.close(fig1)
-    print(f"  Regret plot saved to: {regret_path}")
-
-    fig2, ax2 = plt.subplots(figsize=(8, 5))
-    mean_ma = moving_avg_matrix.mean(axis=0)
-    std_ma = moving_avg_matrix.std(axis=0)
-    ax2.plot(rounds, mean_ma, color="#C1583A",
-              label=f"moving avg reward (window={MOVING_AVG_WINDOW} rounds)",
-              marker='|', markevery=marker_spacing, markersize=8)
-    ax2.fill_between(rounds, mean_ma - std_ma, mean_ma + std_ma,
-                      alpha=0.2, color="#C1583A")
-    ax2.yaxis.set_major_locator(MaxNLocator(10))
-    ax2.set_xlabel("Round (t)  ->  1 to T, one full auction per round")
-    ax2.set_ylabel(f"Reward averaged over the last {MOVING_AVG_WINDOW} rounds\n"
-                     f"(local/recent performance, NOT cumulative)")
-    ax2.set_title(f"Stage 0 [{label}]: moving average reward (local trend)")
-    ax2.legend()
-    fig2.tight_layout()
-    ma_path = config_result["out_dir"] / "figures" / "moving_avg_reward.png"
-    fig2.savefig(ma_path, dpi=150)
-    plt.close(fig2)
-    print(f"  Moving average plot saved to: {ma_path}")
-
-
-def make_comparison_plot(config_results: list):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import MaxNLocator
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    colors = ["#2A6F77", "#C1583A", "#6A5ACD", "#4C9A2A"]
-    
-    linestyles = ['-', '--', '-.', ':']
-
-    for i, cfg_result in enumerate(config_results):
-        T = cfg_result["T"]
-        rounds = np.arange(1, T + 1)
-        mean_regret = cfg_result["regret_matrix"].mean(axis=0)
-        marker_spacing = max(1, T // 10)
-        
-        ax.plot(rounds, mean_regret, label=cfg_result["label"],
-                 color=colors[i % len(colors)],
-                 linestyle=linestyles[i % len(linestyles)], # Variasi garis
-                 marker='|', markevery=marker_spacing, markersize=8)
-
-    ax.yaxis.set_major_locator(MaxNLocator(10)) # Detail sumbu Y dinamis
-    ax.set_xlabel("Round (t)")
-    ax.set_ylabel("Mean cumulative static regret")
-    ax.set_title("Stage 0: regret comparison across parameter configurations")
-    ax.legend()
-    fig.tight_layout()
-
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    fig_path = OUTPUT_ROOT / "comparison_all_configs.png"
-    fig.savefig(fig_path, dpi=150)
-    plt.close(fig)
-    print(f"\nComparison plot (all configs) saved to: {fig_path}")
+    for p in save_standard_report(bundle, out_dir, window=MOVING_AVG_WINDOW):
+        tqdm.write(f"  saved {p.relative_to(PROJECT_ROOT)}")
+    return bundle
 
 
 def main():
-    config_results = []
-    for cfg in CONFIGS:
-        result = run_config(cfg)
-        make_individual_plot(result)
-        config_results.append(result)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--quick", action="store_true",
+                    help="tiny run (T=500, 2 seeds) into results/stage0_quick")
+    args = ap.parse_args()
 
-    make_comparison_plot(config_results)
+    configs = [dict(c) for c in CONFIGS]
+    out_root = PROJECT_ROOT / "results" / "stage0"
+    if args.quick:
+        out_root = PROJECT_ROOT / "results" / "stage0_quick"
+        for c in configs:
+            c["T"], c["n_seeds"] = 500, 2
 
-    print("\n=== All configs done. Output layout: ===")
-    for r in config_results:
-        print(f"  results/stage0/{r['label']}/tables/{{raw_results,checkpoint_regret,summary}}.csv")
-        print(f"  results/stage0/{r['label']}/figures/regret_cumulative.png")
-        print(f"  results/stage0/{r['label']}/figures/moving_avg_reward.png")
-    print("  results/stage0/comparison_all_configs.png")
+    bundles = [run_config(c, out_root) for c in configs]
+
+    out_root.mkdir(parents=True, exist_ok=True)
+    save_fig(plot_comparison(bundles, "regret",
+                             title="Stage 0: regret across configurations"),
+             out_root / "comparison_regret.png")
+    save_fig(plot_comparison(bundles, "reward", window=MOVING_AVG_WINDOW,
+                             title="Stage 0: moving-average reward across configurations"),
+             out_root / "comparison_reward.png")
+    tqdm.write(f"\nDone. Outputs in {out_root.relative_to(PROJECT_ROOT)}/")
 
 
 if __name__ == "__main__":

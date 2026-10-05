@@ -1,88 +1,118 @@
 """
 bob_sunkcost.py
 
-Bob: a rule-based (non-learning) opponent agent that models the
-sunk-cost fallacy. Like Alice, Bob does not "learn" in the bandit
-sense -- his rule is scripted, but the rule itself changes over time
-(t) and reacts to his own accumulated sunk cost within an auction.
-This is the "scripted but non-stationary from the agent's point of
-view" distinction discussed earlier (see docs/design_decisions.md).
+Bob: ADAPTIVE ADVERSARY with sunk-cost escalation (design_decisions.md
+sec. 13-16).
 
-Two modes are implemented, corresponding to Stage 1a and Stage 1b of
-the experiment plan:
+What "adaptive" means here (and what it does not)
+-------------------------------------------------
+Bob's regime for round t (Rational / Escalating) depends on the agent's
+behaviour in PREVIOUS rounds (a rolling window of her aggressiveness),
+never on the round index. Inside one auction his bids are a function of
+the live state (x, y) as before; that within-auction reactivity is NOT
+what makes him adaptive (sec. 13).
 
-    - "single_switch": Bob behaves like Alice (rational) for rounds
-      t <= switch_round. From switch_round onward, he is PERMANENTLY
-      in "escalation mode": once his own bid within an auction crosses
-      `sunk_cost_threshold`, he continues bidding with a probability
-      that increases with his accumulated sunk cost (an exponential
-      escalation curve), up to a hard ceiling `escalation_ceiling`.
+Bob is adaptive but not a learner: his reaction rule is fixed and hand
+designed (window mean -> escalation probability); nothing in it optimizes
+an objective of Bob's own (sec. 2).
 
-    - "recurring_switch": Bob toggles between rational and escalation
-      mode multiple times across the T-round horizon, according to a
-      list of switch points. This is the harder, more realistic test
-      case that demonstrates the practical value of EXP3.S +
-      Page-Hinkley over algorithms that only need to adapt once.
+Per-round protocol (the runner MUST follow this order)
+------------------------------------------------------
+    regime  = bob.begin_round()          # decide regime from history up to t-1
+    log.append((t, bob.regime_label))    # realized_regime_log (sec. 15)
+    strat   = bob.get_strategy()         # fresh closure every round
+    result  = env.run(alice_strategy, strat, ...)
+    bob.observe_agent_move(signal_t)     # signal in [0,1], e.g. theta_t / budget
 
-IMPORTANT (see our earlier discussion on determinism): because Bob's
-escalation decision is PROBABILISTIC (not a deterministic function of
-(x, y) alone), his strategy is NOT a valid deterministic strategy in
-the sense required by Waniek et al.'s Lemma 1 (the prefix
-side-information trick). This is intentional and should be flagged
-explicitly in the thesis: it is precisely the relaxation that breaks
-ELP's side-information assumption and motivates evaluating ELP under
-a weakened/adapted guarantee when facing Bob.
+Snapshot / hindsight safety (README rule, sec. 16)
+--------------------------------------------------
+`snapshot()` returns a deep copy including the private RNG, so the copy
+and the live Bob evolve independently: stepping a snapshot never mutates
+the live window, dwell counter or RNG.
+  * Never cache the closure returned by get_strategy() on the instance:
+    deepcopy does not copy functions, so a cached closure in a clone
+    would still point at the ORIGINAL Bob and its RNG.
+  * Always call get_strategy() on the object (live or snapshot) you are
+    actually stepping.
+  * The regime log lives in the runner, not in Bob, so snapshots stay
+    small (window deque + a few scalars + RNG state).
+
+Design extension flagged for your decision: `min_dwell`
+-------------------------------------------------------
+With min_dwell=1 the regime is re-drawn EVERY round (exactly sec. 13), so
+the regime can flicker round to round and "phases" in realized_regime_log
+become 1-round long. Per-phase hindsight regret needs persistent phases,
+so `min_dwell>1` holds a drawn regime for at least that many rounds. The
+default (1) preserves sec. 13 behaviour.
 """
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+import copy
+import math
+import warnings
+from collections import deque
+from typing import Callable, Deque, Dict, Optional
+
+import numpy as np
 
 StrategyFn = Callable[[int, int], int]
+
+REGIME_RATIONAL = "Rational"
+REGIME_ESCALATING = "Escalating"
 
 
 class Bob:
     """
-    Sunk-cost fallacy opponent agent.
-
     Parameters
     ----------
-    stake : float
-        Value of the prize (s).
-    budget : int
-        Bob's nominal maximum bid under rational play (b). Note his
-        escalation ceiling may legitimately exceed this once he is in
-        escalation mode -- this models a player who is willing to
-        "dig into" funds beyond their normal comfort budget once
-        sunk-cost reasoning takes over.
-    increment : int, default 1
-        Minimal bid increment (delta).
-    mu : float, default 0.8
-        Same meaning as Alice's mu: while rational, Bob folds once his
-        next bid would exceed mu * stake.
-    sunk_cost_threshold : float, default 5.0
-        The amount of Bob's own accumulated bid within ONE auction
-        (i.e. his current x) beyond which escalation dynamics can
-        trigger, once he is in escalation mode.
-    escalation_rate : float, default 0.5
-        Rate parameter of the exponential escalation curve: higher
-        values mean the probability of continuing to bid rises faster
-        as sunk cost accumulates beyond the threshold.
-    escalation_ceiling : float, default 20.0
-        Hard cap on how high Bob will ever bid, even while escalating.
-    mode : {"single_switch", "recurring_switch"}, default "single_switch"
-        Which temporal escalation pattern to use (see module docstring).
-    switch_round : int, default 1000
-        For "single_switch" mode: the round t after which Bob
-        permanently enters escalation mode.
-    switch_points : list[int], optional
-        For "recurring_switch" mode: a sorted list of round indices at
-        which Bob's regime flips (rational <-> escalation). E.g.
-        [1000, 3000, 4000, 7000] means: rational until 1000, escalation
-        from 1000-3000, rational from 3000-4000, escalation from
-        4000-7000, rational from 7000 onward.
+    stake, budget, increment, mu : as in Alice. While rational, Bob folds
+        when his next bid would exceed mu * stake or the budget.
+    sunk_cost_threshold : float, optional
+        Bob's own bid x at/above which sunk-cost dynamics apply (while
+        escalating). Default 0.5 * fold_threshold. Must be <= fold
+        threshold, otherwise Bob can never reach it and escalation is
+        silently a no-op (e.g. stake=5, mu=0.8 -> fold at 4 < old default
+        threshold 5.0).
+    prior_sunk_cost : float
+        Investment Bob ALREADY has when the auction starts (e.g. compute
+        progress of a job that was running before). Added to his own bid
+        when deciding whether he is "hooked": effective sunk cost =
+        x + prior_sunk_cost. Default 0 = original behaviour. Without it
+        Bob only becomes hooked after HE has bid, so when the learner opens
+        the auction Bob folds like a rational player and escalation can
+        only matter in the ~half of rounds where Bob starts. When > 0, Bob
+        still always opens if asked to move first (a hooked Bob never
+        "skips" an auction).
+    escalation_rate : float
+        Rate of the within-auction curve p_continue = 1 - exp(-rate*(x-thr)).
+        (Unchanged from the previous version; note p_continue = 0 exactly
+        at x == thr.)
+    escalation_ceiling : float, optional
+        Hard cap on Bob's bid while escalating. Default = budget. The
+        environment clips all bids to the shared budget, so a ceiling
+        above `budget` is clamped (with a warning).
+    window : int
+        Size W of the rolling window of the agent's aggressiveness signals.
+    escalation_gain : float
+        p_escalate = clip(gain * mean(window), 0, 1). With signals
+        theta/budget and gain=1 this is sec. 13's min(1, mean_theta/budget).
+    min_dwell : int
+        Minimum number of rounds a drawn regime is held (see module doc).
+    min_history : int, optional
+        Bob does not react (p_escalate = 0) until his window holds at least
+        this many observations. Default None = `window`, i.e. he waits for
+        a FULL window. (With min_history=1 a single early observation can
+        already give p_escalate = 1, which is how the first smoke run showed
+        P_Escalate=1.0 at round 2.)
+    fixed_regime : bool, optional
+        None (default) = adaptive Bob. True/False pins the regime to
+        Escalating/Rational forever (an "oracle" Bob). Used by calibration
+        and sweeps to measure each regime in isolation; never in the real
+        experiments.
     rng : numpy.random.Generator, optional
-        Random generator for reproducibility.
+        Bob's PRIVATE generator. Do not share it with the agent, the
+        environment, or any hindsight code.
     """
 
     def __init__(
@@ -91,108 +121,172 @@ class Bob:
         budget: int,
         increment: int = 1,
         mu: float = 0.8,
-        sunk_cost_threshold: float = 5.0,
+        sunk_cost_threshold: Optional[float] = None,
+        prior_sunk_cost: float = 0.0,
         escalation_rate: float = 0.5,
-        escalation_ceiling: float = 20.0,
-        mode: str = "single_switch",
-        switch_round: int = 1000,
-        switch_points: Optional[List[int]] = None,
+        escalation_ceiling: Optional[float] = None,
+        window: int = 50,
+        escalation_gain: float = 1.0,
+        min_dwell: int = 1,
+        min_history: Optional[int] = None,
+        fixed_regime: Optional[bool] = None,
         rng=None,
     ) -> None:
-        import numpy as np
-
-        if mode not in ("single_switch", "recurring_switch"):
-            raise ValueError("mode must be 'single_switch' or 'recurring_switch'")
-        if mode == "recurring_switch" and not switch_points:
-            raise ValueError(
-                "switch_points must be provided (non-empty) when "
-                "mode='recurring_switch'"
-            )
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        if min_history is None:
+            min_history = window
+        if not (1 <= min_history <= window):
+            raise ValueError("min_history must be in [1, window]")
+        if min_dwell < 1:
+            raise ValueError("min_dwell must be >= 1")
 
         self.stake = stake
         self.budget = budget
         self.increment = increment
         self.mu = mu
         self.fold_threshold = mu * stake
+
+        if sunk_cost_threshold is None:
+            sunk_cost_threshold = 0.5 * self.fold_threshold
+        if sunk_cost_threshold > self.fold_threshold:
+            raise ValueError(
+                f"sunk_cost_threshold={sunk_cost_threshold} exceeds the "
+                f"rational fold threshold mu*stake={self.fold_threshold}: "
+                "Bob could never reach it and escalation would be a no-op."
+            )
         self.sunk_cost_threshold = sunk_cost_threshold
-        self.escalation_rate = escalation_rate
+
+        if escalation_ceiling is None:
+            escalation_ceiling = float(budget)
+        elif escalation_ceiling > budget:
+            warnings.warn(
+                f"escalation_ceiling={escalation_ceiling} > budget={budget}; "
+                "the environment clips bids to the shared budget, clamping.",
+                stacklevel=2,
+            )
+            escalation_ceiling = float(budget)
+        if escalation_ceiling <= self.fold_threshold:
+            warnings.warn(
+                "escalation_ceiling <= rational fold threshold: escalation "
+                "cannot push Bob beyond rational play.",
+                stacklevel=2,
+            )
         self.escalation_ceiling = escalation_ceiling
-        self.mode = mode
-        self.switch_round = switch_round
-        self.switch_points = sorted(switch_points) if switch_points else []
+
+        if prior_sunk_cost < 0:
+            raise ValueError("prior_sunk_cost must be >= 0")
+        self.prior_sunk_cost = prior_sunk_cost
+        self.escalation_rate = escalation_rate
+        self.window = window
+        self.escalation_gain = escalation_gain
+        self.min_dwell = min_dwell
+        self.min_history = min_history
+        self.fixed_regime = fixed_regime
         self.rng = rng if rng is not None else np.random.default_rng()
 
-    # ------------------------------------------------------------------
-    # Regime logic: is Bob "rational" or "escalating" at round t?
-    # ------------------------------------------------------------------
-
-    def is_escalating_at(self, t: int) -> bool:
-        """
-        Ground-truth regime label for round t. This is exactly the
-        ground truth used later to compute detection delay for
-        Page-Hinkley (src/metrics/detection_delay.py) and to compute
-        switching regret per-phase (src/metrics/regret.py) -- so
-        keep this function as the single source of truth for "when
-        did Bob's regime actually change".
-        """
-        if self.mode == "single_switch":
-            return t > self.switch_round
-
-        # recurring_switch: count how many switch points have passed;
-        # an even count means still in the ORIGINAL regime (rational),
-        # an odd count means currently flipped (escalating).
-        n_switches_passed = sum(1 for sp in self.switch_points if t > sp)
-        return n_switches_passed % 2 == 1
+        self._window: Deque[float] = deque(maxlen=window)
+        self._escalating: bool = False
+        self._dwell_left: int = 0
 
     # ------------------------------------------------------------------
-    # Strategy construction
+    # History-dependent regime logic
     # ------------------------------------------------------------------
 
-    def get_strategy(self, t: int) -> StrategyFn:
-        """
-        Returns the strategy function f(x, y) for Bob AT ROUND t.
+    def aggressiveness_score(self) -> float:
+        """Mean of the agent's recent aggressiveness signals (0 if none)."""
+        if not self._window:
+            return 0.0
+        return float(sum(self._window) / len(self._window))
 
-        Unlike Alice, this must be re-obtained (or at least
-        re-evaluated) for every round, since which branch of logic
-        applies depends on t via `is_escalating_at`.
+    def p_escalate(self) -> float:
+        """Probability of entering/holding escalation, from history only."""
+        if len(self._window) < self.min_history:
+            return 0.0
+        return min(1.0, max(0.0, self.escalation_gain * self.aggressiveness_score()))
 
-        Note the returned function is stochastic when Bob is in
-        escalation mode (see module docstring on the determinism
-        implications).
+    def begin_round(self) -> bool:
         """
-        escalating = self.is_escalating_at(t)
+        Decide this round's regime from history up to the previous round.
+        Call exactly once per round, BEFORE get_strategy(). Returns True
+        if escalating.
+        """
+        if self.fixed_regime is not None:
+            self._escalating = bool(self.fixed_regime)
+            return self._escalating
+        if self._dwell_left > 0:
+            self._dwell_left -= 1
+        else:
+            self._escalating = bool(self.rng.random() < self.p_escalate())
+            self._dwell_left = self.min_dwell - 1
+        return self._escalating
+
+    def observe_agent_move(self, signal: float) -> None:
+        """
+        Record the agent's aggressiveness for the round just played.
+        `signal` should be in [0, 1] (e.g. theta_t / budget; an observable
+        alternative is the agent's final bid / budget). Clipped to [0, 1].
+        """
+        self._window.append(min(1.0, max(0.0, float(signal))))
+
+    @property
+    def current_regime(self) -> bool:
+        """True if escalating in the current round."""
+        return self._escalating
+
+    @property
+    def regime_label(self) -> str:
+        """Label for the DataCollector's Bob_Regime column."""
+        return REGIME_ESCALATING if self._escalating else REGIME_RATIONAL
+
+    # ------------------------------------------------------------------
+    # Within-auction strategy
+    # ------------------------------------------------------------------
+
+    def get_strategy(self) -> StrategyFn:
+        """
+        Strategy f(x, y) for the CURRENT round (regime captured now).
+        Stochastic while escalating (draws from this Bob's private RNG).
+        Build it fresh each round; do not cache it (see module doc).
+        """
+        escalating = self._escalating
 
         def strategy(x: int, y: int) -> int:
             next_bid = y + self.increment
+            sunk = x + self.prior_sunk_cost
+            opening = (x == 0 and y == 0)       # Bob is asked to move first
 
-            if not escalating:
-                # Rational phase: identical logic to Alice.
+            if ((not escalating) or sunk < self.sunk_cost_threshold
+                    or (opening and self.prior_sunk_cost > 0)):
                 if next_bid > self.fold_threshold or next_bid > self.budget:
                     return y
                 return next_bid
 
-            # Escalation phase.
-            if x < self.sunk_cost_threshold:
-                # Not yet "hooked" -- behave rationally until the sunk
-                # cost threshold is crossed within this auction.
-                if next_bid > self.fold_threshold or next_bid > self.budget:
-                    return y
-                return next_bid
-
-            # Past the sunk-cost threshold: probability of continuing
-            # increases with accumulated sunk cost x, following an
-            # exponential escalation curve, capped at escalation_ceiling.
             if next_bid > self.escalation_ceiling:
-                return y  # hard ceiling reached -> fold
+                return y
 
-            p_continue = 1 - pow(2.71828182845905, -self.escalation_rate * (x - self.sunk_cost_threshold))
-            # p_continue in [0, 1); rises toward 1 as x grows past the
-            # threshold. (Using pow(e, ...) directly to avoid an extra
-            # numpy/math import at module load time; swap for
-            # numpy.exp / math.exp freely.)
-
+            p_continue = 1.0 - math.exp(
+                -self.escalation_rate * (sunk - self.sunk_cost_threshold)
+            )
             if self.rng.random() < p_continue:
                 return next_bid
-            return y  # folds despite being "hooked", with prob 1 - p_continue
+            return y
 
         return strategy
+
+    # ------------------------------------------------------------------
+    # Snapshot support (hindsight / counterfactual re-simulation)
+    # ------------------------------------------------------------------
+
+    def snapshot(self) -> "Bob":
+        """Independent deep copy, including the private RNG state."""
+        return copy.deepcopy(self)
+
+    def fingerprint(self) -> Dict:
+        """Comparable summary of all mutable state (for tests)."""
+        return {
+            "window": tuple(self._window),
+            "escalating": self._escalating,
+            "dwell_left": self._dwell_left,
+            "rng_state": copy.deepcopy(self.rng.bit_generator.state),
+        }

@@ -1,289 +1,295 @@
-# Dollar Auction Bandit — Adaptive Adversary
+# Repeated Dollar Auction — Multi-Armed Bandits vs. an Adaptive Adversary
 
-> **Major design pivot (see `docs/design_decisions.md` §13–18 for full rationale):**
-> The opponent (Bob) is no longer a purely *scripted/oblivious* agent whose regime
-> switches on a fixed, pre-determined schedule. Bob is now a **genuine adaptive
-> adversary** in the formal bandit-theory sense: his probability of entering the
-> "escalation" (sunk-cost) regime at round *t* depends on the **history of arms the
-> agent actually played in previous rounds**, not on a wall-clock schedule. This
-> directly matches the definition of adaptive adversary used to justify adversarial
-> bandits (EXP3-family) in the first place, and is the reason this project keeps that
-> framework rather than switching to non-stationary *stochastic* bandit methods.
+Bachelor thesis (Computer Science). Extends **Waniek, Tran-Thanh & Michalak (2016), "Repeated Dollar Auctions: A Multi-Armed Bandit Approach"** (AAMAS 2016) from a static to a **non-stationary, adaptive** setting, and maps it onto **computational resource contention (cloud spot-instance bidding)**.
 
-This thesis extends the framework of **Waniek, Tran-Thanh, & Michalak (2016), "Repeated Dollar Auctions: A Multi-Armed Bandit Approach"** (AAMAS 2016) in the following directions:
-
-1. **Adaptive opponent** — Bob's regime transitions are driven by the agent's own recent bidding history.
-2. **Switching/dynamic regret** — replacing the evaluation benchmark from static regret to switching regret.
-3. **Change-responsive algorithms** — comparing ELP against EXP3, EXP3.S, and EXP3.S + **Page-Hinkley test**.
-4. **Computational Resource Contention (N-player extension)** — scaling from 2 players to an N-player environment modeling cloud/edge spot instance bidding and all-pay resource contention.
-5. **Robust Simulation Orchestration** — leveraging the Mesa framework for strict event scheduling and memory-safe data collection over massive horizons.
+> Rationale for every non-trivial choice lives in `docs/design_decisions.md` (sec. 13–16 cover the adaptive-adversary pivot). Notation: `docs/notation.md`.
 
 ---
 
-## 📁 project structure
+## 1. Research summary
+
+| | |
+|---|---|
+| **Base theory** | Waniek et al. (2016): the repeated dollar auction as an adversarial MAB; ELP with prefix side-information (Lemma 1). |
+| **What we add** | (1) an **adaptive adversary** (Bob) whose regime depends on the learner's recent play; (2) **switching/dynamic regret** as the benchmark; (3) **EXP3.S + Page-Hinkley** reset as change-responsive learner; (4) a **computational-resource-contention** domain (EC2 spot bidding); (5) an **N-player** extension. |
+| **Arm set `S0`** | The *threshold strategy family* (Waniek Sec. 5.2): `f_θ` follows O'Neill's optimal strategy until the opponent's bid reaches θ, then passes. One arm per θ ∈ {0,…,b}. |
+| **Reward** | Continuous, normalized to [0,1] (`DollarAuction.normalize_reward`), never binary win/lose. |
+
+### Theoretical scope (read before writing claims)
+- **Proven in the paper:** ELP achieves Õ(√T) **static** regret on the threshold family (Thm 6 / Cor 7), because playing a high-θ arm reveals the outcome of all lower-θ arms (prefix property, Lemma 1).
+- **Not proven (our empirical contribution):** any guarantee for EXP3, EXP3.S, or EXP3.S+Page-Hinkley against Bob, or for **switching** regret. Present these as hypotheses tested by simulation.
+- **Adaptive Bob ⇒ policy-regret flavour.** The learner's own play changes Bob's future behaviour, so a counterfactual "arm g all along" must be **re-simulated** from a Bob snapshot (sec. 16). Bob's rolling window gives him bounded memory, which is what keeps this meaningful.
+- **To verify before citing:** Thm 6 claims α(G)=1 for the (directed) side-information graph; check that the cited ELP theorem covers directed graphs.
+- ELP's Lemma-1 replay stays valid *within a round* (Bob's regime is fixed before the auction starts) but not across rounds (sec. 14).
+
+---
+
+## 2. Roadmap (three phases)
+
+| Phase | Setting | Environment | Status |
+|---|---|---|---|
+| **Phase 1** | 1v1 synthetic: Learner (MAB) vs. Bob (adaptive adversary) | abstract Dollar Auction (`dollar_auction.py`) | in progress |
+| **Phase 2** | 1v1 EC2 spot simulator | Computational Resource Contention model based on Khandelwal et al. (ICCUBEA 2018) | planned |
+| **Phase 3** | N-player MAS: N agents, each running a MAB algorithm, compete in a shared compute pool | N-player contention engine | planned |
+
+Experiment folders map onto phases:
+
+| Phase | Folder | Purpose |
+|---|---|---|
+| 1 | `experiments/stage0_baseline_replication/` | Validate our ELP against the paper's setting (rational, oblivious opponent; static regret). **Standalone script, frozen.** |
+| 1 | `experiments/stage1_adaptive_1v1/` | ELP vs EXP3 vs EXP3.S vs EXP3.S+PH against the **adaptive Bob**, 1v1. Bob scenarios (slow / fast reaction: window `W`, `min_dwell`, gain) are *configurations of one experiment*, not separate stages. |
+| 2 | `experiments/stage2_ec2_spot/` | 1v1 on the spot-market simulator. |
+| 3 | `experiments/stage3_nplayer/` | N-player contention. |
+| — | `experiments/stage_optional_swoopo/` | *Optional / undecided:* Swoopo penny-auction validation (dropped from the core roadmap pending advisor decision). |
+
+> **Numbering changed.** Old README: Stage 2 = N-player, Stage 3 = Swoopo. Now: Phase 2 = EC2 1v1, Phase 3 = N-player. `design_decisions.md` sec. 7, 11, 17, 19–20 still use the old numbering and need updating.
+
+**Stage 1a/1b were merged into one stage.** They only made sense for the old scripted Bob (single vs. recurring *fixed* switch times). With the adaptive Bob, escalation times are an outcome of play (sec. 15), so "rare vs. frequent switching" is just a Bob configuration (e.g. large `W` + large `min_dwell` vs. small `W` + small `min_dwell`). Run both as scenarios inside `stage1_adaptive_1v1` and report the realized switch-time distribution across seeds. `design_decisions.md` sec. 6 and 15 still mention 1a/1b and need updating.
+
+---
+
+## 3. Agents (terminology — important)
+
+- **Learner ("Alice" in the thesis text)** — rational MAB agent; chooses a threshold arm θ each round with ELP / EXP3 / EXP3.S / EXP3.S+PH. In code this is the *learner/agent*.
+- **Bob** — **adaptive adversary**, not a learner. Fixed, hand-designed reaction rule that is **history-dependent**: a rolling window (size `W`) of the learner's aggressiveness (e.g. θ/b) → `p_escalate` → per-round regime draw (Rational / Escalating). While escalating, within-auction sunk-cost dynamics apply (probabilistic continuation past a sunk-cost threshold, up to a ceiling). Extra parameters: `prior_sunk_cost` (investment Bob brings into each auction — without it he only gets hooked after *he* bids, so when the learner opens he folds like a rational player and the regimes barely differ), `min_history` (Bob does not react until his window is full), `min_dwell` (persistent regimes), and `fixed_regime` (oracle Bob for calibration only).
+- **Rational opponent** (`alice_rational.py`, class `Alice`) — the oblivious fixed-rule opponent used only in Stage 0. ⚠ *Name clash with the thesis's "Alice".* Recommended: rename file/class to `rational_opponent.py` / `RationalOpponent`.
+
+Why "adaptive" matters: the reward may depend on the learner's *previous-round* choices, which is exactly what justifies adversarial-bandit methods over non-stationary *stochastic* ones (sec. 1). Within-auction reactivity does not count (sec. 13).
+
+---
+
+## 4. Domain mapping: Dollar Auction → EC2 spot instances
+
+Source: Khandelwal, Chaturvedi & Gupta, *Bidding Strategies for Amazon EC2 Spot Instances — A Comprehensive Review* (ICCUBEA 2018).
+
+| Dollar Auction | Compute / spot-instance meaning |
+|---|---|
+| Stake `s` | Value of completing the job on contested spot capacity |
+| Bid `x` | Bid price / compute committed for the spot instance |
+| Threshold `θ` | **Bid cap** — the highest price the user will chase |
+| Budget `b` | Maximum affordable bid (e.g. on-demand price or above) |
+| All-pay / sunk cost | **Out-of-bid termination**: price rises above the bid, the instance is revoked, un-checkpointed work is lost and must be redone |
+| Bob's escalation | A user protecting accumulated progress by raising bids (sunk-cost fallacy) |
+
+The review's static bidding strategies (Bid Min, Mean, On-Demand 30 %, 70 %, On-Demand, Max) are natural candidates for the Phase-2 θ grid, and its job-size / price-volatility suitability table (Table 1) can parametrize scenarios.
+
+**Modelling caveats (state them in the thesis):**
+1. In real EC2 the user pays the *market* price, not their bid, and a partial hour ended by the provider is not billed. The all-pay property therefore applies to **lost work**, not to bid payment. Phase 2 must define the cost model explicitly.
+2. AWS replaced bidding with simplified pricing in 2018 (ref. [23] of the review). Phase 2 models the legacy market stylistically.
+3. The ICCUBEA paper is a literature review (it summarizes strategies proposed in other works; its only own empirical part is an analysis of EC2 price traces whose data/method are not released). Use it for qualitative structure and parametrization, not as a dataset.
+4. **Price traces cannot validate auction dynamics.** A trace contains the exogenous market price, not competitors' bids, so a dollar-auction/escalation process cannot be replayed or validated from it. Phase 2 is therefore a **model-based simulator**; traces are optional, only to make the price process realistic (e.g. trace-driven background price).
+5. Ben-Yehuda et al. (the work cited as [22] in the review) report that legacy EC2 spot prices were usually *not* market-driven but drawn at random from a tight interval via a dynamic hidden reserve price (their CloudCom 2011 paper; confirm the claim in the journal version before citing). So the legacy market was not a genuine N-bidder auction either: our all-pay/escalation mapping is a **stylized scenario**, and the thesis should say so.
+
+**Public data that exists (optional use):** Calvin Ardi's *Amazon EC2 Spot Price History* (2014–2015 and 2017–2023; https://ant.isi.edu/~calvin/data/ec2-spot-price/, also on Zenodo). Only the 2014–2015 part is clearly from the bidding era; later years follow the 2018 pricing change.
+
+---
+
+## 5. Project structure
+
+Legend: ✅ done · 🔧 done, but still needs checking · ⬜ not yet written
 
 ```
 dollar-auction-bandit/
-│
 ├── README.md
 ├── requirements.txt
-├── .gitignore
+├── pytest.ini                         # ✅ pythonpath=. so tests can `import src...`
+├── .gitignore                         # must contain .venv/
 │
 ├── src/
 │   ├── environment/
-│   │   ├── dollar_auction.py          # Core 2-player logic (Xb formalization)
-│   │   ├── dollar_auction_nplayer.py  # N-player computational resource contention
-│   │   └── strategies.py              # Strategy set S0 definition
+│   │   ├── dollar_auction.py          # ✅ 2-player all-pay auction (Xb formalization)
+│   │   ├── strategies.py              # ✅ O'Neill + threshold strategies (arm set S0)
+│   │   ├── dollar_auction_nplayer.py  # ⬜ Phase 3
+│   │   └── spot_market.py             # ⬜ Phase 2 (resource-contention simulator)
 │   │
 │   ├── opponents/
-│   │   ├── alice_rational.py          # Rational control baseline
-│   │   ├── bob_sunkcost.py            # Adaptive adversary (memory-based escalation)
-│   │   └── population.py              # Heterogeneous N-player generator
+│   │   ├── alice_rational.py          # ✅ oblivious rational opponent (Stage 0)
+│   │   ├── bob_sunkcost.py            # 🔧 adaptive adversary (rolling window, snapshot-safe)
+│   │   └── population.py              # ⬜ Phase 3 heterogeneous population
 │   │
 │   ├── algorithms/
-│   │   ├── base.py                    # Interface: select_arm() and update()
-│   │   ├── elp.py                     # ELP with Lemma-1 prefix side-information
-│   │   ├── exp3.py                    # Classic EXP3
-│   │   ├── exp3s.py                   # EXP3.S (switching regret variant)
-│   │   └── page_hinkley.py            # Standalone changepoint detection module
+│   │   ├── base.py                    # ✅ interface: select_arm / update(info) / reset
+│   │   ├── elp.py                     # ✅ ELP (no reset() yet -> cannot be paired with PH)
+│   │   ├── exp3.py                    # ✅ EXP3
+│   │   ├── exp3s.py                   # ⬜ EXP3.S
+│   │   └── page_hinkley.py            # 🔧 direction fixed (detects reward DROP), warm-up added
 │   │
-│   ├── metrics/
-│   │   ├── regret.py                  # Static and dynamic/switching regret computation
-│   │   └── detection_delay.py         # Measures Page-Hinkley detection speed
+│   ├── metrics/                       # NOTE: regret.py / detection_delay.py do NOT exist yet
+│   │   ├── plots.py                   # ✅ shared standard plot set (Stage 0 = baseline; later stages add layers)
+│   │   ├── regret.py                  # ⬜ per-phase switching regret (re-simulation from Bob snapshots)
+│   │   └── detection_delay.py         # ⬜ PH alarm round vs. realized Bob regime change
 │   │
 │   └── simulation/
-│       ├── runner.py                  # Mesa Model orchestration and DataCollector
-│       └── config.py                  # Centralized experiment parameters
+│       ├── config.py                  # 🔧 SimConfig dataclass (+ `stage1_config()` recommended starting point)
+│       ├── calibration.py             # 🔧 per-arm rewards vs. a regime-pinned Bob + separation score
+│       └── runner.py                  # 🔧 AuctionSimulation (pure core) + thin Mesa wrapper
 │
 ├── experiments/
-│   ├── stage0_baseline_replication/   # Implementation validation vs Alice
-│   ├── stage1a_single_switch/         # Single-episode escalation test
-│   ├── stage1b_recurring_switch/      # Continuous adaptation robustness test
-│   ├── stage2_nplayer/                # Computational resource bidding
-│   └── stage3_real_data/              # Swoopo dataset validation
+│   ├── stage0_baseline_replication/run_stage0.py   # ✅ standalone (no runner/Mesa); tqdm + shared plots + Thm-6 bound; `--quick` for a smoke run
+│   ├── calibrate_regimes.py           # 🔧 PRE-FLIGHT: one config at a time, with control rows
+│   ├── sweep_bob.py                   # 🔧 PRE-FLIGHT: grid search (Part A regime separation, Part B adaptive dynamics)
+│   ├── smoke_mesa.py                  # 🔧 end-to-end check of the Mesa wrapper
+│   ├── stage1_adaptive_1v1/           # ⬜ (merged 1a+1b; Bob scenarios as configs)
+│   ├── stage2_ec2_spot/               # ⬜
+│   └── stage3_nplayer/                # ⬜
 │
-├── data/            # /raw, /processed, /synthetic
-├── results/         # Output tables and figures per stage
-├── notebooks/       # Exploratory analysis
-├── tests/           # Pytest unit tests for core mechanics
-└── docs/            # Design decisions and notation glossaries
+├── tests/
+│   ├── test_environment.py            # ✅ 5 tests
+│   ├── test_opponents.py              # 🔧 6 tests (rewritten for the adaptive Bob)
+│   ├── test_page_hinkley.py           # 🔧 4 tests
+│   ├── test_bob_sunkcost.py           # 🔧 15 tests
+│   ├── test_runner.py                 # 🔧 10 tests
+│   ├── test_plots.py                  # 🔧 3 tests
+│   └── test_calibration.py            # 🔧 4 tests
+│
+├── data/            # raw (read-only) / processed / synthetic
+├── results/         # per-stage figures and tables
+├── notebooks/       # exploration only
+└── docs/            # design_decisions.md, notation.md
 ```
+
+### What the less obvious files are for
+- **`src/simulation/config.py`** — one `SimConfig` dataclass (budget, stake, T, seed, Bob parameters, Page-Hinkley parameters). The runner reads *only* from it, so an experiment is fully described by one object and nothing is hard-coded across files. Stage 1+ scripts build a `SimConfig`; Stage 0 predates it and keeps its own `CONFIGS` list.
+- **`src/simulation/runner.py`** — `AuctionSimulation` holds all simulation logic and randomness (testable without Mesa). `AuctionModel` (a `mesa.Model`) only calls `sim.step()` and lets `DataCollector` log. It also stores `phase_starts` (Bob snapshots) for hindsight regret. It does **not** compute regret.
+- **`experiments/calibrate_regimes.py`** — run it **before** any Stage 1 experiment. It plays every fixed θ against an always-rational Bob and an always-escalating Bob, and reports whether the best arm *differs* between the two regimes and how costly it is to use the wrong one (`score = min(A, B)`, reward units in [0,1]). If it does not, there is nothing for EXP3.S/PH to track: retune Bob, budget or stake. **`experiments/sweep_bob.py`** does this systematically: Part A searches (budget, stake, Bob `mu`, `prior_sunk_cost`, rate); Part B sweeps the adaptive parameters (window, `min_dwell`, gain) against a real learner and reports phase counts/lengths. Both write CSVs to `results/sweeps/`. Page-Hinkley threshold calibration (`calibrate_threshold`) belongs in the same pre-flight step.
+- **`experiments/smoke_mesa.py`** — a 200-round run through the Mesa path; fails loudly if the Mesa API usage is wrong.
 
 ---
 
-## 📂 Folder Descriptions
+## 6. Conventions
 
-### `src/environment/`
-
-The "world" where the auction takes place.
-
-- `dollar_auction.py` — core 2-player logic: state `(x, y)` definition, payment rules, auction termination. Follows the `Xb` formalization in Waniek et al. (Section 2.1).
-- `dollar_auction_nplayer.py` — generalization to N players (Stage 2). Payment rules (who must pay when the auction ends) and bidding order **must be defined explicitly**, since the original paper provides no precedent for this case — document these decisions in `docs/design_decisions.md`.
-- `strategies.py` — defines the strategy set `S0` (arms), e.g. the family of O'Neill threshold strategies with varying `θ`.
-
-### `src/opponents/`
-
-Scripted/rule-based opponents, not learners (see the note in `docs/design_decisions.md` on why only the main agent learns).
-
-- `alice_rational.py` — rational agent, follows a fixed profit-maximizing threshold rule.
-- `bob_sunkcost.py` — sunk-cost fallacy agent. Supports **single-switch** mode (permanent one-time regime change, for Stage 1a) and **recurring-switch** mode (repeated regime changes, for Stage 1b).
-- `population.py` — generator for a heterogeneous Alice/Bob population with configurable proportions (for Stage 2).
-
-### `src/algorithms/`
-
-The core contribution. All algorithms **must follow the same interface** (see "Interface Convention" below) so they can be swapped in `runner.py` without special-case code.
-
-- `elp.py` — ELP implementation (Algorithm 1 in Waniek et al.), leveraging the *prefix strategy* structure for side-information.
-- `exp3.py` — base EXP3 (Auer et al. 2002), adversarial bandit baseline for static regret.
-- `exp3s.py` — EXP3.S (Auer et al. 2002, shifting/tracking variant), designed for switching regret.
-- `page_hinkley.py` — standalone changepoint detection module, designed to plug into EXP3.S as a reset trigger.
-
-### `src/metrics/`
-
-The "Engine" of the project. It defines *how* the simulation runs, but does not dictate *what* specific scenario is being tested.
-
-- `runner.py` — The core simulation engine. Wraps the environment and algorithms into a `mesa.Model`. It handles the execution of a single simulation run (T rounds) and safely logs data using Mesa's `DataCollector`. 
-- `config.py` — A single centralized place for default hyperparameters (T, γ, δ, λ, Bob proportion, etc.) to prevent hardcoding across files.
-
-### `src/simulation/`
-
-- `runner.py` — main loop: run T rounds, call the environment and the algorithm, log results in a standard format.
-- `config.py` — a single centralized place for all parameters (T, γ, δ, λ, Bob proportion, etc.) — avoid hardcoding parameters scattered across files.
-
-### `experiments/`
-
-The "Drivers" of the project. These execution scripts import the engine from `src/simulation/runner.py` and inject specific stage configurations. They are responsible for orchestrating multi-seed execution (using `tqdm`), extracting the Pandas DataFrames from Mesa, generating Matplotlib charts, and saving the final CSVs to the `results/` folder.
-
-| Stage                         | Contents                                                                                                                  |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `stage0_baseline_replication` | Replicate Waniek et al.'s original setup (2 players, ELP, static regret, Alice-only opponent) — implementation validation |
-| `stage1a_single_switch`       | ELP vs EXP3 vs EXP3.S vs EXP3.S+PH, opponent Bob switches regime once (Single-episode escalation test)                    |
-| `stage1b_recurring_switch`    | Same as 1a, but Bob switches regime repeatedly (Robustness test for the Page-Hinkley reset mechanism)                     |
-| `stage2_nplayer`              | Extension to N players, modeling computational resource contention and spot instance bidding                              |
-| `stage3_real_data`            | External validation with the Swoopo dataset                                        |
-
-### `data/`
-
-- `raw/` — original files, **read-only**, never overwrite/modify directly.
-- `processed/` — cleaned/preprocessed results ready for analysis.
-- `synthetic/` — optional, for saving synthetic simulation outputs to file (so they can be reproduced without re-running).
-
-### `results/`
-
-Outputs per stage (figures & tables) kept in separate folders — makes writing the thesis results chapter easier, just pull from the folder matching the chapter being written.
-
-### `notebooks/`
-
-For quick exploration, interactive debugging, and visualization — not production/final code.
-
-### `tests/`
-
-Unit tests to ensure the implementation is correct before it's used for any scientific claim. Example required test: "if all arms have equal reward, the arm-selection probability should approach uniform."
-
-### `docs/`
-
-- `design_decisions.md` — **must be kept continuously updated**. Log every design decision (N-player payment rules, why the generic regret bound is used instead of the improved version, Bob's escalation definition, etc.) so both of you stay in sync and don't forget the reasoning when writing the thesis.
-- `notation.md` — mathematical notation glossary, following the style of Table 1 (Appendix) in Waniek et al., to keep notation consistent across code and writing.
-
----
-
-### 🌉 Domain Mapping: Dollar Auction to Computational Systems
-To bridge the classical game-theoretic model with distributed systems, we map the core mechanics of the Dollar Auction as follows:
-* **The Stake ($s$):** Exclusive access to a limited computational resource (e.g., a GPU slot, critical network bandwidth, or spot instance time).
-* **The Bid ($x$):** Resource commitment (e.g., CPU cycles spent, prioritized packets, or compute time allocated).
-* **The Budget ($b$):** The maximum computational capacity or timeout threshold of a specific node/container.
-* **The All-Pay Mechanism:** Preemption loss. If a process is outbid and forcibly preempted before completing its task, the computational resources already invested are lost without yielding a result (sunk-cost).
-
----
-
-## ⚙️ Environment Requirements
-This project uses an isolated Python virtual environment to manage dependencies securely without conflicting with system packages.
-
-**1. Create and activate the virtual environment:**
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-- **Python 3.10+**
-- Core libraries:
-  - `numpy` — numerical computation
-  - `pandas` — simulation result data management
-  - `matplotlib` / `seaborn` — visualization (cumulative regret plots, etc.)
-  - `scipy` — ready-made statistical functions (distributions, etc.)
-  - `pytest` — unit testing
-  - `jupyter` — exploratory notebooks
-
-```bash
-pip install -r requirements.txt
-```
-
-Core libraries `requirements.txt`:
-
-```
-numpy
-pandas
-matplotlib
-seaborn
-scipy
-pytest
-jupyter
-tqdm
-mesa
-SMPyBandits
-```
-
----
-
-## 🤝 Collaboration Conventions
-
-### Simulation Orchestration via Mesa
-
-To handle multi-round bandit loops cleanly and prevent memory leaks over thousands of iterations, this project utilizes Mesa.
-- The DollarAuction environment remains pure logic.
-- src/simulation/runner.py wraps the environment in a mesa.Model.
-- Agents (Learner and Bob) are wrapped as mesa.Agent.
-- Per-round data logging is handled entirely by mesa.DataCollector. Avoid manual list appending for global simulation states.
-
-### Algorithm Interface (must be agreed on before coding)
-
-Every algorithm class in `src/algorithms/` must expose the same methods, at minimum:
-
+### Algorithm interface (`src/algorithms/base.py`)
 ```python
 class BanditAlgorithm:
-    def select_arm(self) -> int:
-        """Select an arm for this round."""
-        ...
+    def select_arm(self) -> int: ...
+    def update(self, arm: int, reward: float, info: dict | None = None) -> None: ...
+    def reset(self) -> None: ...      # required for use with Page-Hinkley
+```
+`info={"agent_state_trace": ...}` is read only by ELP (Lemma-1 replay); EXP3-family ignores it. The runner always passes it.
 
-    def update(self, arm: int, reward: float) -> None:
-        """Update internal state based on the observed reward."""
-        ...
+### Per-round order (do not reorder — it keeps Bob's regime a function of history up to t−1)
+```
+snapshot Bob → bob.begin_round() → select_arm → run auction → update(arm, reward, info)
+→ bob.observe_agent_move(signal) → detector.update(reward) → (alarm ⇒ algorithm.reset())
 ```
 
-This lets `runner.py` call any algorithm (ELP, EXP3, EXP3.S) with the same code, without algorithm-specific if-else branches.
+### Hindsight / counterfactual rule
+Any hindsight computation against Bob **must** use a deep-copied snapshot (`bob.snapshot()`), never the live Bob. Do not cache `bob.get_strategy()` closures on an instance (deepcopy would leave them pointing at the original). Covered by `tests/test_bob_sunkcost.py` and `tests/test_runner.py`.
 
-### Simulation Result Data Format (via Mesa DataCollector)
-Data is collected automatically without manual looping, outputting two distinct Pandas DataFrames:
+### Randomness & reproducibility
+One `seed` per run → `SeedSequence.spawn(3)` → three **independent** generators: learner, Bob, environment (starting player). Bob's RNG is private; hindsight code never touches live generators. Report means ± CI over many seeds, never single runs.
 
-**1. Model-Level Data (System wide metrics per round)**
-| Column              | Description                                                                       |
-| ------------------- | --------------------------------------------------------------------------------- |
-| `Round`             | Time index t (one complete resource contention event)                             |
-| `Cumulative_Regret` | The learning agent's total static/dynamic regret up to round t                    |
-| `Bob_Regime`        | Current opponent regime label (Rational / Escalating)                             |
-| `Winning_Bid`       | The highest resource commitment that won the execution slot                       |
-
-**2. Agent-Level Data (Per-agent metrics per round)**
-| Column              | Description                                                                       |
-| ------------------- | --------------------------------------------------------------------------------- |
-| `Agent_ID`          | Unique identifier (Learner, Alice, Bob_1, Bob_N)                                  |
-| `Chosen_Arm`        | The strategy threshold ($\theta$) selected by the agent                           |
-| `Reward`            | Normalized payoff (Positive if slot won, negative based on sunk-cost if preempted)|
-
-### Random Seed Policy
-
-Agree on a seeding mechanism (e.g. explicit seed per run, logged in `config.py`) so every experiment can be reproduced identically.
-
-### Git Workflow
-
-- Use separate branches per feature/stage (e.g. `feature/exp3s`, `experiment/stage0`)
-- Pull request + review before merging into `main`
-- Descriptive commit messages, referencing the relevant experiment stage
-
-**One addition specific to the pivot:** any function that computes a *hindsight* or *counterfactual* outcome against Bob (used for regret computation) **must** operate on a frozen/deep-copied snapshot of Bob's internal state, never the live Bob instance being updated by the real simulation loop. Mixing the two silently corrupts the regret calculation. Document any such snapshot logic clearly at the call site.
+### Logged data (Mesa `DataCollector`)
+Model level: `Round`, `Bob_Regime`, `P_Escalate`, `Winning_Bid`, `Cumulative_Reward`, `PH_Detected`.
+Agent level: `Agent_ID`, `Chosen_Arm`, `Reward`.
+`Cumulative_Regret` is **computed post-hoc** by `src/metrics/regret.py` from the records and Bob snapshots (it needs re-simulation, so it is not a per-step column).
 
 ---
 
-## 👥 Work Division (proposed)
+## 7. Environment setup & running
 
-| Member   | Responsibility |
-| -------- | -------------- |
-| **A**    |                |
-| **B**    |                |
-| **Both** |                |
+```bash
+python3 -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install "mesa>=3.0" networkx numpy pandas matplotlib seaborn scipy tqdm pytest
+```
+`requirements.txt`: `mesa>=3.0, networkx (Mesa 3.5 imports it but does not declare it), numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, jupyter`. **SMPyBandits** is optional (baseline UCB only, later); it is old and may conflict with Mesa 3 / recent NumPy, so install it last and drop it if it does.
+
+```bash
+pytest -v                                                      # expect 47 passed
+python -m experiments.smoke_mesa                               # Mesa wrapper check
+python -m experiments.calibrate_regimes                        # before Stage 1
+python -m experiments.sweep_bob --part A                       # search Bob/auction parameters
+python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replication
+```
+
+### Tooling policy
+- **Custom engine** is the core (auction, bandits, regret, detection).
+- **Mesa 3.0+** only for orchestration and `DataCollector` — no spatial grid. Agents are `Agent(model)` (no `unique_id`), no `mesa.time` schedulers.
+- **SMPyBandits** only for single-player baseline algorithms; its multi-player algorithms target collision problems and do not fit.
+- **tqdm** for progress bars in experiment drivers.
 
 ---
 
-## 📚 Key References
+## 8. Open decisions
+
+| # | Decision | Where it matters |
+|---|---|---|
+| 1 | Bob `min_dwell` (1 = per-round redraw as in sec. 13; >1 = persistent phases). Part B suggests 25–50 gives tens of phases per 4000 rounds | Per-phase hindsight needs persistent phases |
+| 2 | Aggressiveness signal: `θ/b` (sec. 13) vs. observable `final_bid/b` | Realism of Bob's information |
+| 3 | ~~Bob/budget/stake tuning~~ **Resolved by `prior_sunk_cost`**: recommended start `stage1_config()` = b=12, s=8, Bob mu=0.5, prior=3, rate=3 (cross-regime loss ≈0.15; Rational → best arms θ≥2, Escalating → θ=0). Old Bob ≈0.03–0.06 | Needs your sign-off: it adds a parameter to sec. 13's Bob |
+| 4 | Phase-2 cost model (what is "paid" when out-bid) | Validity of the all-pay mapping |
+| 5 | N-player payment rule and turn order (sec. 7) | Phase 3 |
+| 6 | Keep or drop Swoopo validation | Scope |
+| 7 | Asymmetric-cost regret (sec. 18) | Optional extension |
+| 8 | **Bob's regime is endogenous** (see Findings below): decide whether to keep it, add an exogenous component, or change the learner/benchmark | Determines whether EXP3.S + Page-Hinkley can show an advantage at all |
+
+---
+
+## 8b. Findings from the Bob sweep (adaptive Bob, b=12, s=8, mu=0.5, prior=3, rate=3; T=3000, 3 seeds)
+
+| Policy | Mean reward |
+|---|---|
+| EXP3 (uniform-ish play, θ≈6) / ELP | ≈ 0.575 |
+| best **fixed** arm (θ=2) | 0.684 |
+| oracle tracker (knows Bob's regime: θ=2 when Rational, θ=0 when Escalating) | 0.727 |
+
+- Bob escalates in proportion to the learner's own average θ/b, so a *moderately cautious* fixed arm already keeps Bob mostly rational (θ=2 ⇒ Bob escalating ≈16 % of rounds; θ=12 ⇒ 99 %).
+- EXP3/ELP do not find θ=2: reward per round looks best for aggressive arms *in the current regime*, but aggression **causes** later escalation. Their gap to the best fixed arm (≈0.11 per round) is a *policy-regret* effect; it grows with T. The value of perfect regime tracking over the best fixed arm is small here (≈0.04).
+- Window `W` (25 vs 100) and `min_dwell` hardly change this; they only change how long phases last (`min_dwell`≈25 → ≈80 phases per 4000 rounds).
+- Consequences to decide on (Open decision #8): (a) report best-fixed-arm and oracle-tracker as reference lines in every Stage 1 plot (cheap, valuable either way); (b) frame the thesis question as external vs. policy regret against a bounded-memory adaptive adversary; (c) add an *exogenous* regime component (e.g. background demand shocks, natural for the EC2 setting) so that tracking becomes valuable; (d) blocking-style learners (Arora, Dekel & Tewari, 2012 — verify before citing) as a known remedy for policy regret with bounded memory.
+
+---
+
+## 9. Collaboration
+
+- Branches per feature/stage (`feature/exp3s`, `experiment/stage1a`); PR + review before merging to `main`; descriptive commits referencing the phase/stage.
+- Keep `docs/design_decisions.md` current — log every decision when it is made.
+
+| Member | Responsibility |
+|---|---|
+| **A** | |
+| **B** | |
+| **Both** | |
+
+---
+
+## 10. Progress
+
+**Phase 1**
+- [x] Stage 0 — ELP baseline replication vs. rational opponent
+- [x] Page-Hinkley direction fix (+ warm-up)
+- [x] Bob rewritten as adaptive adversary (rolling window, snapshot-safe)
+- [x] `runner.py` / `config.py` (core tested; Mesa wrapper pending `smoke_mesa`)
+- [ ] `exp3s.py`, `ELP.reset()`
+- [ ] `regret.py` (per-phase hindsight), `detection_delay.py`
+- [ ] Regime calibration (`calibrate_regimes.py`) → choose Stage 1 scenario parameters
+- [ ] Stage 1 (adaptive Bob, 1v1; slow/fast Bob scenarios)
+
+**Phase 2** 
+- [ ] spot-market simulator 
+- [ ] Stage 2 experiments
+
+**Phase 3** 
+- [ ] N-player engine 
+- [ ] population generator 
+- [ ] Stage 3 experiments
+
+---
+
+## 11. Key references
 
 1. Waniek, M., Tran-Thanh, L., & Michalak, T. (2016). *Repeated Dollar Auctions: A Multi-Armed Bandit Approach.* AAMAS 2016.
-2. Auer, P., Cesa-Bianchi, N., Freund, Y., & Schapire, R. E. (2002). *The Nonstochastic Multiarmed Bandit Problem.* SIAM Journal on Computing, 32(1). (Source of EXP3 & EXP3.S)
-3. Mannor, S., & Shamir, O. (2011). *From Bandits to Experts: On the Value of Side-Observations.* NeurIPS. (Foundation of the ELP algorithm)
-4. Besbes, O., Gur, Y., & Zeevi, A. (2014). *Stochastic Multi-Armed-Bandit Problem with Non-stationary Rewards.* NeurIPS.
-5. Garivier, A., & Moulines, E. (2011). *On Upper-Confidence Bound Policies for Switching Bandit Problems.*
-6. O'Neill, B. (1986). *International Escalation and the Dollar Auction.* Journal of Conflict Resolution, 30(1).
-7. Augenblick, N. (2015). *The Sunk-Cost Fallacy in Penny Auctions.* (Source of Swoopo data validation)
-8. Byers, J., Mitzenmacher, M., & Zervas, G. (2010). *Information Asymmetries in Pay-Per-Bid Auctions: How Swoopo Makes Bank.* (Source of the Swoopo dataset)
-9. Poland, J. (2005). *FPL analysis for adaptive bandits.* 3rd Symposium on Stochastic Algorithms, Foundations and Applications (SAGA'05). — cited by Waniek et al. (footnote 2) as the argument extending the Mannor–Shamir regret proof to adaptive adversaries; central to justifying the adaptive-Bob design.
-10. Zheng, H., et al. (2015). *Bidding for Highly Available Services with Low Price in Spot Instance Market.* (Or any general paper on Cloud/Edge Spot Instance bidding and preemption).
-11. Zaman, S., & Grosu, D. (2013). *Combinatorial Auction-Based Allocation of Virtual Machine Instances in Clouds.* IEEE Transactions on Parallel and Distributed Systems.
-
----
-
-## 🗺️ Progress Status
-
-- [ ] Stage 0 — Baseline ELP 2-player replication
-- [ ] Stage 1a — Single-switch test (ELP vs EXP3 vs EXP3.S vs EXP3.S+PH)
-- [ ] Stage 1b — Recurring-switch test
-- [ ] Stage 2 — N-player extension
-- [ ] Stage 3 — Swoopo data validation
+2. Khandelwal, V., Chaturvedi, A. K., & Gupta, C. P. (2018). *Bidding Strategies for Amazon EC2 Spot Instances — A Comprehensive Review.* ICCUBEA 2018.
+3. Auer, P., Cesa-Bianchi, N., Freund, Y., & Schapire, R. E. (2002). *The Nonstochastic Multiarmed Bandit Problem.* SIAM J. Computing 32(1). (EXP3, EXP3.S)
+4. Mannor, S., & Shamir, O. (2011). *From Bandits to Experts: On the Value of Side-Observations.* NeurIPS. (ELP)
+5. Poland, J. (2005). *FPL analysis for adaptive bandits.* SAGA'05. (extends the regret argument to adaptive adversaries; cited in Waniek footnote 2)
+6. O'Neill, B. (1986). *International Escalation and the Dollar Auction.* J. Conflict Resolution 30(1).
+7. Besbes, O., Gur, Y., & Zeevi, A. (2014). *Stochastic Multi-Armed-Bandit Problem with Non-stationary Rewards.* NeurIPS.
+8. Garivier, A., & Moulines, E. (2011). *On Upper-Confidence Bound Policies for Switching Bandit Problems.* ALT.
+9. Guo, W., Chen, K., Wu, Y., & Zheng, W. (2015). *Bidding for Highly Available Services with Low Price in Spot Instance Market.* HPDC '15.
+10. Zaman, S., & Grosu, D. (2013). *Combinatorial auction-based allocation of virtual machine instances in clouds.* J. Parallel and Distributed Computing 73(4).
+11. Karunakaran, S., & Sundarraj, R. P. (2015). *Bidding Strategies for Spot Instances in Cloud Computing Markets.* IEEE Internet Computing 19(3).
+12. Kushwaha, V., & Simmhan, Y. (2014). *Cloudy with a Spot of Opportunity: Analysis of Spot-Priced VMs for Practical Job Scheduling.* CCEM 2014.
+13. *(Optional, Swoopo)* Byers, J., Mitzenmacher, M., & Zervas, G. (2010). *Information Asymmetries in Pay-Per-Bid Auctions: How Swoopo Makes Bank.* · Augenblick, N. (2015). *The Sunk-Cost Fallacy in Penny Auctions.*
