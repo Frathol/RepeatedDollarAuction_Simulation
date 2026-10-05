@@ -37,15 +37,14 @@ Experiment folders map onto phases:
 | Phase | Folder | Purpose |
 |---|---|---|
 | 1 | `experiments/stage0_baseline_replication/` | Validate our ELP against the paper's setting (rational, oblivious opponent; static regret). **Standalone script, frozen.** |
-| 1 | `experiments/stage1a_single_switch/` | ELP vs EXP3 vs EXP3.S vs EXP3.S+PH; Bob configured so escalation episodes are rare (cleanest detection-delay measurement). |
-| 1 | `experiments/stage1b_recurring_switch/` | Same, with Bob configured for repeated escalation (robustness of the PH reset). |
+| 1 | `experiments/stage1_adaptive_1v1/` | ELP vs EXP3 vs EXP3.S vs EXP3.S+PH against the **adaptive Bob**, 1v1. Bob scenarios (slow / fast reaction: window `W`, `min_dwell`, gain) are *configurations of one experiment*, not separate stages. |
 | 2 | `experiments/stage2_ec2_spot/` | 1v1 on the spot-market simulator. |
 | 3 | `experiments/stage3_nplayer/` | N-player contention. |
 | — | `experiments/stage_optional_swoopo/` | *Optional / undecided:* Swoopo penny-auction validation (dropped from the core roadmap pending advisor decision). |
 
 > **Numbering changed.** Old README: Stage 2 = N-player, Stage 3 = Swoopo. Now: Phase 2 = EC2 1v1, Phase 3 = N-player. `design_decisions.md` sec. 7, 11, 17, 19–20 still use the old numbering and need updating.
 
-Stage 1a/1b are **configuration regimes**, not fixed schedules: Bob's escalation times are an outcome of play (sec. 15). Report the realized switch-time distribution across seeds.
+**Stage 1a/1b were merged into one stage.** They only made sense for the old scripted Bob (single vs. recurring *fixed* switch times). With the adaptive Bob, escalation times are an outcome of play (sec. 15), so "rare vs. frequent switching" is just a Bob configuration (e.g. large `W` + large `min_dwell` vs. small `W` + small `min_dwell`). Run both as scenarios inside `stage1_adaptive_1v1` and report the realized switch-time distribution across seeds. `design_decisions.md` sec. 6 and 15 still mention 1a/1b and need updating.
 
 ---
 
@@ -77,13 +76,17 @@ The review's static bidding strategies (Bid Min, Mean, On-Demand 30 %, 70 %, On-
 **Modelling caveats (state them in the thesis):**
 1. In real EC2 the user pays the *market* price, not their bid, and a partial hour ended by the provider is not billed. The all-pay property therefore applies to **lost work**, not to bid payment. Phase 2 must define the cost model explicitly.
 2. AWS replaced bidding with simplified pricing in 2018 (ref. [23] of the review). Phase 2 models the legacy market stylistically.
-3. The ICCUBEA paper is a literature review: use it for qualitative structure and parametrization, not as a dataset.
+3. The ICCUBEA paper is a literature review (it summarizes strategies proposed in other works; its only own empirical part is an analysis of EC2 price traces whose data/method are not released). Use it for qualitative structure and parametrization, not as a dataset.
+4. **Price traces cannot validate auction dynamics.** A trace contains the exogenous market price, not competitors' bids, so a dollar-auction/escalation process cannot be replayed or validated from it. Phase 2 is therefore a **model-based simulator**; traces are optional, only to make the price process realistic (e.g. trace-driven background price).
+5. Ben-Yehuda et al. (the work cited as [22] in the review) report that legacy EC2 spot prices were usually *not* market-driven but drawn at random from a tight interval via a dynamic hidden reserve price (their CloudCom 2011 paper; confirm the claim in the journal version before citing). So the legacy market was not a genuine N-bidder auction either: our all-pay/escalation mapping is a **stylized scenario**, and the thesis should say so.
+
+**Public data that exists (optional use):** Calvin Ardi's *Amazon EC2 Spot Price History* (2014–2015 and 2017–2023; https://ant.isi.edu/~calvin/data/ec2-spot-price/, also on Zenodo). Only the 2014–2015 part is clearly from the bidding era; later years follow the 2018 pricing change.
 
 ---
 
 ## 5. Project structure
 
-Legend: ✅ done · 🔧 done, needs your check · ⬜ not yet written
+Legend: ✅ done · 🔧 done, but needs check · ⬜ not yet written
 
 ```
 dollar-auction-bandit/
@@ -111,8 +114,9 @@ dollar-auction-bandit/
 │   │   ├── exp3s.py                   # ⬜ EXP3.S
 │   │   └── page_hinkley.py            # 🔧 direction fixed (detects reward DROP), warm-up added
 │   │
-│   ├── metrics/
-│   │   ├── regret.py                  # ⬜ static + per-phase switching regret (re-simulation from Bob snapshots)
+│   ├── metrics/                       # NOTE: regret.py / detection_delay.py do NOT exist yet
+│   │   ├── plots.py                   # ✅ shared standard plot set (Stage 0 = baseline; later stages add layers)
+│   │   ├── regret.py                  # ⬜ per-phase switching regret (re-simulation from Bob snapshots)
 │   │   └── detection_delay.py         # ⬜ PH alarm round vs. realized Bob regime change
 │   │
 │   └── simulation/
@@ -120,18 +124,20 @@ dollar-auction-bandit/
 │       └── runner.py                  # 🔧 AuctionSimulation (pure core) + thin Mesa wrapper
 │
 ├── experiments/
-│   ├── stage0_baseline_replication/run_stage0.py   # ✅ standalone, does not use runner/Mesa
+│   ├── stage0_baseline_replication/run_stage0.py   # ✅ standalone (no runner/Mesa); tqdm + shared plots + Thm-6 bound; `--quick` for a smoke run
 │   ├── calibrate_regimes.py           # 🔧 PRE-FLIGHT tool for Stage 1 (see below)
 │   ├── smoke_mesa.py                  # 🔧 end-to-end check of the Mesa wrapper
-│   ├── stage1a_single_switch/         # ⬜
-│   ├── stage1b_recurring_switch/      # ⬜
+│   ├── stage1_adaptive_1v1/           # ⬜ (merged 1a+1b; Bob scenarios as configs)
 │   ├── stage2_ec2_spot/               # ⬜
 │   └── stage3_nplayer/                # ⬜
 │
 ├── tests/
+│   ├── test_environment.py            # ✅ 5 tests
+│   ├── test_opponents.py              # 🔧 6 tests (rewritten for the adaptive Bob)
 │   ├── test_page_hinkley.py           # 🔧 4 tests
 │   ├── test_bob_sunkcost.py           # 🔧 8 tests
-│   └── test_runner.py                 # 🔧 10 tests
+│   ├── test_runner.py                 # 🔧 10 tests
+│   └── test_plots.py                  # 🔧 3 tests
 │
 ├── data/            # raw (read-only) / processed / synthetic
 ├── results/         # per-stage figures and tables
@@ -183,12 +189,12 @@ Agent level: `Agent_ID`, `Chosen_Arm`, `Reward`.
 python3 -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\Activate.ps1
 pip install --upgrade pip
-pip install "mesa>=3.0" numpy pandas matplotlib seaborn scipy tqdm pytest
+pip install "mesa>=3.0" networkx numpy pandas matplotlib seaborn scipy tqdm pytest
 ```
-`requirements.txt`: `mesa>=3.0, numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, jupyter`. **SMPyBandits** is optional (baseline UCB only, later); it is old and may conflict with Mesa 3 / recent NumPy, so install it last and drop it if it does.
+`requirements.txt`: `mesa>=3.0, networkx (Mesa 3.5 imports it but does not declare it), numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, jupyter`. **SMPyBandits** is optional (baseline UCB only, later); it is old and may conflict with Mesa 3 / recent NumPy, so install it last and drop it if it does.
 
 ```bash
-pytest -v                                                      # expect 22 passed
+pytest -v                                                      # expect 36 passed
 python -m experiments.smoke_mesa                               # Mesa wrapper check
 python -m experiments.calibrate_regimes                        # before Stage 1
 python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replication
@@ -238,11 +244,17 @@ python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replica
 - [x] `runner.py` / `config.py` (core tested; Mesa wrapper pending `smoke_mesa`)
 - [ ] `exp3s.py`, `ELP.reset()`
 - [ ] `regret.py` (per-phase hindsight), `detection_delay.py`
-- [ ] Regime calibration (`calibrate_regimes.py`) → choose Stage 1 parameters
-- [ ] Stage 1a, Stage 1b
+- [ ] Regime calibration (`calibrate_regimes.py`) → choose Stage 1 scenario parameters
+- [ ] Stage 1 (adaptive Bob, 1v1; slow/fast Bob scenarios)
 
-**Phase 2** — [ ] spot-market simulator · [ ] Stage 2 experiments
-**Phase 3** — [ ] N-player engine · [ ] population generator · [ ] Stage 3 experiments
+**Phase 2** 
+- [ ] spot-market simulator 
+- [ ] Stage 2 experiments
+
+**Phase 3** 
+- [ ] N-player engine 
+- [ ] population generator 
+- [ ] Stage 3 experiments
 
 ---
 
