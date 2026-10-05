@@ -51,7 +51,7 @@ Experiment folders map onto phases:
 ## 3. Agents (terminology — important)
 
 - **Learner ("Alice" in the thesis text)** — rational MAB agent; chooses a threshold arm θ each round with ELP / EXP3 / EXP3.S / EXP3.S+PH. In code this is the *learner/agent*.
-- **Bob** — **adaptive adversary**, not a learner. Fixed, hand-designed reaction rule that is **history-dependent**: a rolling window (size `W`) of the learner's aggressiveness (e.g. θ/b) → `p_escalate` → per-round regime draw (Rational / Escalating). While escalating, within-auction sunk-cost dynamics apply (probabilistic continuation past a sunk-cost threshold, up to a ceiling).
+- **Bob** — **adaptive adversary**, not a learner. Fixed, hand-designed reaction rule that is **history-dependent**: a rolling window (size `W`) of the learner's aggressiveness (e.g. θ/b) → `p_escalate` → per-round regime draw (Rational / Escalating). While escalating, within-auction sunk-cost dynamics apply (probabilistic continuation past a sunk-cost threshold, up to a ceiling). Extra parameters: `prior_sunk_cost` (investment Bob brings into each auction — without it he only gets hooked after *he* bids, so when the learner opens he folds like a rational player and the regimes barely differ), `min_history` (Bob does not react until his window is full), `min_dwell` (persistent regimes), and `fixed_regime` (oracle Bob for calibration only).
 - **Rational opponent** (`alice_rational.py`, class `Alice`) — the oblivious fixed-rule opponent used only in Stage 0. ⚠ *Name clash with the thesis's "Alice".* Recommended: rename file/class to `rational_opponent.py` / `RationalOpponent`.
 
 Why "adaptive" matters: the reward may depend on the learner's *previous-round* choices, which is exactly what justifies adversarial-bandit methods over non-stationary *stochastic* ones (sec. 1). Within-auction reactivity does not count (sec. 13).
@@ -86,7 +86,7 @@ The review's static bidding strategies (Bid Min, Mean, On-Demand 30 %, 70 %, On-
 
 ## 5. Project structure
 
-Legend: ✅ done · 🔧 done, but needs check · ⬜ not yet written
+Legend: ✅ done · 🔧 done, but still needs checking · ⬜ not yet written
 
 ```
 dollar-auction-bandit/
@@ -120,12 +120,14 @@ dollar-auction-bandit/
 │   │   └── detection_delay.py         # ⬜ PH alarm round vs. realized Bob regime change
 │   │
 │   └── simulation/
-│       ├── config.py                  # 🔧 SimConfig dataclass: every experiment parameter in one place
+│       ├── config.py                  # 🔧 SimConfig dataclass (+ `stage1_config()` recommended starting point)
+│       ├── calibration.py             # 🔧 per-arm rewards vs. a regime-pinned Bob + separation score
 │       └── runner.py                  # 🔧 AuctionSimulation (pure core) + thin Mesa wrapper
 │
 ├── experiments/
 │   ├── stage0_baseline_replication/run_stage0.py   # ✅ standalone (no runner/Mesa); tqdm + shared plots + Thm-6 bound; `--quick` for a smoke run
-│   ├── calibrate_regimes.py           # 🔧 PRE-FLIGHT tool for Stage 1 (see below)
+│   ├── calibrate_regimes.py           # 🔧 PRE-FLIGHT: one config at a time, with control rows
+│   ├── sweep_bob.py                   # 🔧 PRE-FLIGHT: grid search (Part A regime separation, Part B adaptive dynamics)
 │   ├── smoke_mesa.py                  # 🔧 end-to-end check of the Mesa wrapper
 │   ├── stage1_adaptive_1v1/           # ⬜ (merged 1a+1b; Bob scenarios as configs)
 │   ├── stage2_ec2_spot/               # ⬜
@@ -135,9 +137,10 @@ dollar-auction-bandit/
 │   ├── test_environment.py            # ✅ 5 tests
 │   ├── test_opponents.py              # 🔧 6 tests (rewritten for the adaptive Bob)
 │   ├── test_page_hinkley.py           # 🔧 4 tests
-│   ├── test_bob_sunkcost.py           # 🔧 8 tests
+│   ├── test_bob_sunkcost.py           # 🔧 15 tests
 │   ├── test_runner.py                 # 🔧 10 tests
-│   └── test_plots.py                  # 🔧 3 tests
+│   ├── test_plots.py                  # 🔧 3 tests
+│   └── test_calibration.py            # 🔧 4 tests
 │
 ├── data/            # raw (read-only) / processed / synthetic
 ├── results/         # per-stage figures and tables
@@ -148,7 +151,7 @@ dollar-auction-bandit/
 ### What the less obvious files are for
 - **`src/simulation/config.py`** — one `SimConfig` dataclass (budget, stake, T, seed, Bob parameters, Page-Hinkley parameters). The runner reads *only* from it, so an experiment is fully described by one object and nothing is hard-coded across files. Stage 1+ scripts build a `SimConfig`; Stage 0 predates it and keeps its own `CONFIGS` list.
 - **`src/simulation/runner.py`** — `AuctionSimulation` holds all simulation logic and randomness (testable without Mesa). `AuctionModel` (a `mesa.Model`) only calls `sim.step()` and lets `DataCollector` log. It also stores `phase_starts` (Bob snapshots) for hindsight regret. It does **not** compute regret.
-- **`experiments/calibrate_regimes.py`** — run it **before** any Stage 1 experiment. It plays every fixed θ against an always-rational Bob and an always-escalating Bob, and reports whether the best arm *differs* between the two regimes. If it does not, there is nothing for EXP3.S/PH to track: retune Bob, budget or stake. Page-Hinkley threshold calibration (`calibrate_threshold`) belongs in the same pre-flight step.
+- **`experiments/calibrate_regimes.py`** — run it **before** any Stage 1 experiment. It plays every fixed θ against an always-rational Bob and an always-escalating Bob, and reports whether the best arm *differs* between the two regimes and how costly it is to use the wrong one (`score = min(A, B)`, reward units in [0,1]). If it does not, there is nothing for EXP3.S/PH to track: retune Bob, budget or stake. **`experiments/sweep_bob.py`** does this systematically: Part A searches (budget, stake, Bob `mu`, `prior_sunk_cost`, rate); Part B sweeps the adaptive parameters (window, `min_dwell`, gain) against a real learner and reports phase counts/lengths. Both write CSVs to `results/sweeps/`. Page-Hinkley threshold calibration (`calibrate_threshold`) belongs in the same pre-flight step.
 - **`experiments/smoke_mesa.py`** — a 200-round run through the Mesa path; fails loudly if the Mesa API usage is wrong.
 
 ---
@@ -194,9 +197,10 @@ pip install "mesa>=3.0" networkx numpy pandas matplotlib seaborn scipy tqdm pyte
 `requirements.txt`: `mesa>=3.0, networkx (Mesa 3.5 imports it but does not declare it), numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, jupyter`. **SMPyBandits** is optional (baseline UCB only, later); it is old and may conflict with Mesa 3 / recent NumPy, so install it last and drop it if it does.
 
 ```bash
-pytest -v                                                      # expect 36 passed
+pytest -v                                                      # expect 47 passed
 python -m experiments.smoke_mesa                               # Mesa wrapper check
 python -m experiments.calibrate_regimes                        # before Stage 1
+python -m experiments.sweep_bob --part A                       # search Bob/auction parameters
 python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replication
 ```
 
@@ -212,13 +216,29 @@ python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replica
 
 | # | Decision | Where it matters |
 |---|---|---|
-| 1 | Bob `min_dwell` (1 = per-round redraw as in sec. 13; >1 = persistent phases) | Per-phase hindsight needs persistent phases |
+| 1 | Bob `min_dwell` (1 = per-round redraw as in sec. 13; >1 = persistent phases). Part B suggests 25–50 gives tens of phases per 4000 rounds | Per-phase hindsight needs persistent phases |
 | 2 | Aggressiveness signal: `θ/b` (sec. 13) vs. observable `final_bid/b` | Realism of Bob's information |
-| 3 | Bob/budget/stake tuning so the best arm differs between regimes | Stage 1 is vacuous otherwise (current defaults barely separate them) |
+| 3 | ~~Bob/budget/stake tuning~~ **Resolved by `prior_sunk_cost`**: recommended start `stage1_config()` = b=12, s=8, Bob mu=0.5, prior=3, rate=3 (cross-regime loss ≈0.15; Rational → best arms θ≥2, Escalating → θ=0). Old Bob ≈0.03–0.06 | Needs your sign-off: it adds a parameter to sec. 13's Bob |
 | 4 | Phase-2 cost model (what is "paid" when out-bid) | Validity of the all-pay mapping |
 | 5 | N-player payment rule and turn order (sec. 7) | Phase 3 |
 | 6 | Keep or drop Swoopo validation | Scope |
 | 7 | Asymmetric-cost regret (sec. 18) | Optional extension |
+| 8 | **Bob's regime is endogenous** (see Findings below): decide whether to keep it, add an exogenous component, or change the learner/benchmark | Determines whether EXP3.S + Page-Hinkley can show an advantage at all |
+
+---
+
+## 8b. Findings from the Bob sweep (adaptive Bob, b=12, s=8, mu=0.5, prior=3, rate=3; T=3000, 3 seeds)
+
+| Policy | Mean reward |
+|---|---|
+| EXP3 (uniform-ish play, θ≈6) / ELP | ≈ 0.575 |
+| best **fixed** arm (θ=2) | 0.684 |
+| oracle tracker (knows Bob's regime: θ=2 when Rational, θ=0 when Escalating) | 0.727 |
+
+- Bob escalates in proportion to the learner's own average θ/b, so a *moderately cautious* fixed arm already keeps Bob mostly rational (θ=2 ⇒ Bob escalating ≈16 % of rounds; θ=12 ⇒ 99 %).
+- EXP3/ELP do not find θ=2: reward per round looks best for aggressive arms *in the current regime*, but aggression **causes** later escalation. Their gap to the best fixed arm (≈0.11 per round) is a *policy-regret* effect; it grows with T. The value of perfect regime tracking over the best fixed arm is small here (≈0.04).
+- Window `W` (25 vs 100) and `min_dwell` hardly change this; they only change how long phases last (`min_dwell`≈25 → ≈80 phases per 4000 rounds).
+- Consequences to decide on (Open decision #8): (a) report best-fixed-arm and oracle-tracker as reference lines in every Stage 1 plot (cheap, valuable either way); (b) frame the thesis question as external vs. policy regret against a bounded-memory adaptive adversary; (c) add an *exogenous* regime component (e.g. background demand shocks, natural for the EC2 setting) so that tracking becomes valuable; (d) blocking-style learners (Arora, Dekel & Tewari, 2012 — verify before citing) as a known remedy for policy regret with bounded memory.
 
 ---
 
