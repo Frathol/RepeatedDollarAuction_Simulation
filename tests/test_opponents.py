@@ -1,86 +1,75 @@
 """
 test_opponents.py
 
-Sanity checks for src/opponents/alice_rational.py and
-src/opponents/bob_sunkcost.py, focused on the REGIME logic (Bob's
-is_escalating_at), since that is the ground truth used later by the
-switching-regret and detection-delay metrics -- it must be exactly
-right.
-"""
+Sanity checks for src/opponents/alice_rational.py (oblivious rational
+opponent, Stage 0) and src/opponents/bob_sunkcost.py (adaptive adversary).
 
-import sys
-from pathlib import Path
+History: the old Bob tests (mode="single_switch", switch_round,
+is_escalating_at, get_strategy(t=...)) were removed together with the
+scripted-schedule Bob. Ground truth for Bob's regime is now the runner's
+realized regime log (design_decisions sec. 15); regime/history logic is
+covered in tests/test_bob_sunkcost.py and tests/test_runner.py. The tests
+below only cover within-auction behaviour of the CURRENT Bob API.
+"""
 
 import numpy as np
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.opponents.alice_rational import Alice
 from src.opponents.bob_sunkcost import Bob
 
 
+def _escalating_bob(**kw):
+    """Bob forced into the escalating regime through the public API:
+    a window full of maximal aggressiveness => p_escalate = 1."""
+    params = dict(stake=10.0, budget=12, window=5, rng=np.random.default_rng(0))
+    params.update(kw)
+    bob = Bob(**params)
+    for _ in range(5):
+        bob.observe_agent_move(1.0)
+    assert bob.begin_round() is True
+    return bob
+
+
 def test_alice_folds_beyond_threshold():
     alice = Alice(stake=10.0, budget=8, mu=0.8)  # fold_threshold = 8.0
     strat = alice.get_strategy()
-    # At y=7, next bid would be 8, which is NOT > 8.0 -> should raise.
+    assert strat(0, 7) == 8      # next bid 8 is not > 8.0 -> raise
+    assert strat(0, 8) == 8      # next bid 9 > 8.0 -> fold
+
+
+def test_bob_fresh_has_no_history_and_is_rational():
+    bob = Bob(stake=10.0, budget=8, rng=np.random.default_rng(0))
+    assert bob.aggressiveness_score() == 0.0
+    assert bob.p_escalate() == 0.0
+    assert bob.begin_round() is False
+    assert bob.regime_label == "Rational"
+
+
+def test_bob_rational_regime_matches_alice_like_behaviour():
+    bob = Bob(stake=10.0, budget=8, rng=np.random.default_rng(0))
+    bob.begin_round()                     # empty history -> rational
+    strat = bob.get_strategy()
     assert strat(0, 7) == 8
-    # At y=8, next bid would be 9, which IS > 8.0 -> should fold (pass).
-    assert strat(0, 8) == 8
+    assert strat(0, 8) == 8               # folds, same as Alice
 
 
-def test_bob_single_switch_regime_boundary():
-    bob = Bob(stake=10.0, budget=8, mode="single_switch", switch_round=1000)
-    assert bob.is_escalating_at(1000) is False
-    assert bob.is_escalating_at(1001) is True
-    assert bob.is_escalating_at(9999) is True
-
-
-def test_bob_recurring_switch_regime_toggles():
-    bob = Bob(
-        stake=10.0,
-        budget=8,
-        mode="recurring_switch",
-        switch_points=[1000, 3000, 4000],
-    )
-    # regime sequence: rational | [1000] escalating | [3000] rational
-    #                  | [4000] escalating
-    assert bob.is_escalating_at(500) is False
-    assert bob.is_escalating_at(1000) is False  # boundary is exclusive
-    assert bob.is_escalating_at(1001) is True
-    assert bob.is_escalating_at(2999) is True
-    assert bob.is_escalating_at(3001) is False
-    assert bob.is_escalating_at(4001) is True
-
-
-def test_bob_recurring_switch_requires_switch_points():
-    with pytest.raises(ValueError):
-        Bob(stake=10.0, budget=8, mode="recurring_switch", switch_points=None)
-
-
-def test_bob_rational_phase_matches_alice_like_behaviour():
-    rng = np.random.default_rng(0)
-    bob = Bob(stake=10.0, budget=8, mode="single_switch", switch_round=1000, rng=rng)
-    strat = bob.get_strategy(t=1)  # rational phase
-    assert strat(0, 7) == 8
-    assert strat(0, 8) == 8  # folds
+def test_bob_escalating_regime_label():
+    bob = _escalating_bob()
+    assert bob.regime_label == "Escalating"
 
 
 def test_bob_escalation_never_exceeds_ceiling():
-    rng = np.random.default_rng(1)
-    bob = Bob(
-        stake=10.0,
-        budget=8,
-        mode="single_switch",
-        switch_round=0,  # escalating from round 1 onward
-        sunk_cost_threshold=2.0,
-        escalation_rate=1.0,
-        escalation_ceiling=15.0,
-        rng=rng,
-    )
-    strat = bob.get_strategy(t=1)
-    # Simulate deep into sunk-cost territory -- bid should never
-    # propose beyond the ceiling regardless of RNG draws.
-    for _ in range(200):
-        next_bid = strat(14, 14)
-        assert next_bid <= 15
+    bob = _escalating_bob(sunk_cost_threshold=2.0, escalation_rate=1.0,
+                          escalation_ceiling=10.0)
+    strat = bob.get_strategy()
+    for _ in range(300):
+        assert strat(10, 10) == 10        # next bid 11 > ceiling -> always folds
+        assert strat(9, 9) in (9, 10)     # may continue up to the ceiling only
+
+
+def test_bob_ceiling_cannot_exceed_budget():
+    with pytest.warns(UserWarning):
+        bob = Bob(stake=10.0, budget=8, escalation_ceiling=15.0,
+                  rng=np.random.default_rng(0))
+    assert bob.escalation_ceiling == 8.0
