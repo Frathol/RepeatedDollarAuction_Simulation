@@ -127,34 +127,115 @@ Metrics: total reward until budget exhaustion, ratio to benchmark, budget utilis
 
 ---
 
-## 9. Project structure
-Legend: ✅ exists and confirmed · 🔧 exists, not yet confirmed on the target machine · ⬜ planned (PROPOSED names)
+'''## 9. Project structure
+Legend: exists and was confirmed · 🔧 exists, not yet confirmed · ⬜ planned · *(legacy)* kept and tested, but not in the main BwK experiments
 
 ```
-src/
-├── environment/
-│   ├── dollar_auction.py      ✅ mechanics unchanged under BwK (reward/cost read from AuctionResult)
-│   ├── strategies.py          ✅ threshold family; unchanged
-│   └── outcomes.py            ⬜ gross reward 1{win} and cost = final_bid / b from an AuctionResult
-├── opponents/
-│   ├── alice_rational.py      ✅      └── bob_sunkcost.py  🔧 (+ memoryless control ⬜)
-├── algorithms/
-│   ├── base.py ✅  elp.py ✅  exp3.py ✅  page_hinkley.py 🔧   (exp3s.py ⬜ legacy)
-│   ├── ucb1.py                ⬜ baseline
-│   └── bwk/  ucb_bwk.py ⬜  sw_ucb_bwk.py ⬜  lagrange_bwk.py ⬜  (shared LP helper ⬜)
-├── metrics/
-│   ├── plots.py               ✅ standard figure set (RunBundle)
-│   ├── regret.py ⬜  policy_regret.py ⬜  nonstationarity.py ⬜ (V̂, Ŵ)
-└── simulation/
-    ├── config.py 🔧  runner.py 🔧 (Mesa wrapper OK)  calibration.py 🔧
-    └── budget.py              ⬜ budget mode ("reset" default | "global"), stop rule
-experiments/  stage0_… ✅  calibrate_regimes 🔧  sweep_bob 🔧  smoke_mesa ✅
-              calibrate_budget ⬜  stage1 ⬜  stage2a ⬜  stage2b ⬜  stage3 ⬜
-configs/*.yaml ⬜ (opponent × budget × algorithm × w × c × B × EC2 flag)   tests/ 🔧
+dollar-auction-bandit/
+│
+├── README.md                              # ✅ overview, roadmap, decisions (kept current)
+├── requirements.txt                       # 🔧 mesa>=3.0, networkx, numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, pyyaml
+├── pytest.ini                             # ✅ pythonpath = .  (tests can `import src...`)
+├── .gitignore                             # ✅ must contain .venv/, results/, data/raw/
+│
+├── configs/                               # ⬜ one YAML per experiment grid
+│   ├── stage1_adaptive_1v1.yaml           # ⬜ Bob scenarios (window w, min_dwell, gain, escalation c)
+│   ├── stage2a_bwk_alice.yaml             # ⬜ algorithm × budget ρ=B/T, seeds
+│   ├── stage2b_bwk_bob.yaml               # ⬜ algorithm × Bob (w, c, w=0 control) × B
+│   └── stage3_ec2_layer.yaml              # ⬜ + AR(1) band/epoch parameters, EC2 feature flag
+│
+├── src/
+│   ├── environment/
+│   │   ├── dollar_auction.py              # ✅ 2-player all-pay auction (Xb formalization); mechanics unchanged under BwK
+│   │   ├── strategies.py                  # ✅ O'Neill + threshold family S0; θ = 0 is the null arm
+│   │   ├── outcomes.py                    # ⬜ from an AuctionResult: gross reward 1{win}, cost = final_bid / b
+│   │   ├── price_process.py               # ⬜ Stage 3: truncated AR(1) in [F, C] with epochs (Ben-Yehuda), VM cost
+│   │   └── dollar_auction_nplayer.py      # ⬜ future work (N-player)
+│   │
+│   ├── opponents/
+│   │   ├── alice_rational.py              # ✅ Alice: deterministic, oblivious opponent (Stage 0 baseline)
+│   │   ├── bob_sunkcost.py                # 🔧 Bob: adaptive opponent (rolling window, snapshot-safe, prior_sunk_cost,
+│   │   │                                  #    min_history, min_dwell, fixed_regime); memoryless-Bernoulli control ⬜
+│   │   └── population.py                  # ⬜ future work (heterogeneous N-player generator)
+│   │
+│   ├── algorithms/
+│   │   ├── base.py                        # ✅ interface: select_arm(), update(arm, reward, info), reset()
+│   │   ├── elp.py                         # ✅ ELP with Lemma-1 prefix side-information (baseline; ELP.reset ⬜)
+│   │   ├── exp3.py                        # ✅ classic EXP3 (baseline)
+│   │   ├── ucb1.py                        # ⬜ classical UCB1 (stochastic baseline)
+│   │   ├── budget_wrappers.py             # ⬜ optional: pacing (cost ≤ B/T), reward − λ·cost, for non-BwK baselines
+│   │   ├── exp3s.py                       # ⬜ (legacy) EXP3.S switching variant
+│   │   ├── page_hinkley.py                # 🔧 (legacy) change detector, reward-drop direction fixed
+│   │   └── bwk/
+│   │       ├── lp.py                      # ⬜ shared single-step LP helper (scipy.optimize.linprog, null arm)
+│   │       ├── ucb_bwk.py                 # ⬜ UCB-BwK (Agrawal & Devanur 2014)
+│   │       ├── sw_ucb_bwk.py              # ⬜ Sliding-Window UCB-BwK (Liu et al. 2022, Alg. 1; windows w1, w2)
+│   │       ├── lagrange_bwk.py            # ⬜ LagrangeBwK (Immorlica et al. 2019; needs OPT estimate)
+│   │       └── primal_dual_bwk.py         # ⬜ optional (Badanidiyuru et al. 2013)
+│   │
+│   ├── metrics/
+│   │   ├── plots.py                       # ✅ shared standard figure set (RunBundle); Stage 0 = baseline, later stages add layers
+│   │   ├── regret.py                      # ⬜ static regret; reward/cost until budget exhaustion; ratio to benchmark
+│   │   ├── benchmarks.py                  # ⬜ dynamic LP (Liu et al.) and empirical best-fixed-distribution grid
+│   │   ├── policy_regret.py               # ⬜ re-simulate whole trajectory from t=1 against a Bob snapshot
+│   │   ├── nonstationarity.py             # ⬜ realized V̂, Ŵ along the path (within-round Monte-Carlo, Bob frozen)
+│   │   └── detection_delay.py             # ⬜ (legacy) Page-Hinkley alarm vs. realized regime change
+│   │
+│   └── simulation/
+│       ├── config.py                      # 🔧 SimConfig (+ stage1_config()): every experiment parameter in one place
+│       ├── runner.py                      # 🔧 AuctionSimulation (pure core) + thin Mesa wrapper; records, phase_starts
+│       ├── calibration.py                 # 🔧 per-arm rewards vs. a regime-pinned Bob, separation score
+│       ├── budget.py                      # ⬜ budget_mode = "reset" (default) | "global"; stop rule; alive mask
+│       ├── yaml_config.py                 # ⬜ YAML → SimConfig grid expansion
+│       └── batch.py                       # ⬜ many seeds × algorithms in parallel (multiprocessing/joblib) with tqdm
+│
+├── experiments/
+│   ├── stage0_baseline_replication/
+│   │   └── run_stage0.py                  # ✅ ELP vs Alice, static regret, Thm-6 bound, --quick (folder name on your machine may differ)
+│   ├── calibrate_regimes.py               # 🔧 pre-flight: does the best arm differ between Bob's regimes?
+│   ├── sweep_bob.py                       # 🔧 pre-flight: Part A regime separation, Part B adaptive dynamics
+│   ├── smoke_mesa.py                      # ✅ end-to-end check of the Mesa wrapper
+│   ├── calibrate_budget.py                # ⬜ per-arm (reward, cost) → choose ρ so the budget actually binds
+│   ├── stage1_adaptive_1v1/               # ⬜ adaptive Bob, per-auction budget reset (policy-regret findings)
+│   ├── stage2a_bwk_alice/                 # ⬜ BwK validation: stationary, vs. LP benchmark
+│   ├── stage2b_bwk_bob/                   # ⬜ BwK vs. reactive Bob: policy regret, V̂/Ŵ, adaptivity index
+│   ├── stage3_ec2_layer/                  # ⬜ AR(1) price epochs + VM cost; dynamic-LP benchmark applies
+│   └── stage_optional_swoopo/             # ⬜ undecided: empirical evidence that escalation exists
+│
+├── tests/
+│   ├── test_environment.py                # ✅ auction mechanics, O'Neill, normalization
+│   ├── test_opponents.py                  # ✅ Alice; Bob within-auction behaviour
+│   ├── test_bob_sunkcost.py               # 🔧 regime/history, snapshot isolation, min_history, fixed_regime, prior_sunk_cost
+│   ├── test_page_hinkley.py               # ✅ (legacy) direction, auto-reset
+│   ├── test_runner.py                     # ✅ schema, reproducibility, independent RNG streams, phase snapshots
+│   ├── test_plots.py                      # ✅ standard figure set
+│   ├── test_calibration.py                # 🔧 separation score, prior_sunk_cost effect
+│   ├── test_outcomes.py                   # ⬜ reward/cost ranges; θ=0 gives (0, 0) vs. Alice and Bob
+│   ├── test_budget.py                     # ⬜ stop rule, reset mode == old behaviour, alive mask
+│   ├── test_bwk_lp.py                     # ⬜ LP on toy instances (ratio arm + null arm, d=1)
+│   ├── test_bwk_algorithms.py             # ⬜ UCB-BwK → stationary LP; SW-UCB-BwK window logic
+│   ├── test_benchmarks.py                 # ⬜ dynamic LP; fixed-distribution grid
+│   ├── test_policy_regret.py              # ⬜ re-simulation never mutates the live Bob
+│   └── test_nonstationarity.py            # ⬜ V̂, Ŵ on a known piecewise-constant instance
+│
+├── data/
+│   ├── raw/                               # read-only; optional external data (EC2 price archive, Swoopo), not committed
+│   ├── processed/                         # small derived artefacts (fitted AR(1) parameters, selected windows)
+│   └── synthetic/                         # optional saved simulation outputs
+├── results/                               # generated; one folder per stage (stage0/, sweeps/, stage1/, …), git-ignored
+├── notebooks/                             # exploration only, never final code
+└── docs/
+    ├── design_decisions.md                # ✅ must be kept current (sec. 6, 7, 11, 15, 17–20 still use the old stage numbering)
+    ├── notation.md                        # ✅ to extend with BwK symbols (B, ρ, d, m, V1, V2, W1, W2, q̄)
+    └── bwk_notes.md                       # ⬜ reading notes: Slivkins Ch. 10, Liu et al., Fikioris et al.
 ```
-Design rule: `budget_mode = "reset"` stays the default so Waniek's replication keeps running.
+
+Design rules: `budget_mode = "reset"` stays the default so Waniek's replication keeps running; `dollar_auction.py` and `strategies.py` do not change for BwK; the **runner owns the stopping rule**, algorithms never see the remaining budget.
 
 ---
+
+'''
+
 
 ## 10. Conventions
 
