@@ -1,251 +1,318 @@
-# Repeated Dollar Auction — Multi-Armed Bandits vs. an Adaptive Adversary
+# Repeated All-Pay (Dollar) Auctions with a Global Budget — Bandits with Knapsacks vs. Reactive Opponents
 
-Bachelor thesis (Computer Science). Extends **Waniek, Tran-Thanh & Michalak (2016), "Repeated Dollar Auctions: A Multi-Armed Bandit Approach"** (AAMAS 2016) from a static to a **non-stationary, adaptive** setting, and maps it onto **computational resource contention (cloud spot-instance bidding)**.
+Bachelor thesis (Computer Science). Starts from **Waniek, Tran-Thanh & Michalak (2016), "Repeated Dollar Auctions: A Multi-Armed Bandit Approach"** (AAMAS 2016) and asks what changes when (i) the bidder has a **global budget across rounds** (→ *Bandits with Knapsacks*, BwK) and (ii) the opponent **reacts to the bidder's own past choices** (→ non-stationarity that is *endogenous*). The application setting is **computational resource contention** (EC2-style spot bidding).
 
-> Rationale for every non-trivial choice lives in `docs/design_decisions.md` (sec. 13–16 cover the adaptive-adversary pivot). Notation: `docs/notation.md`.
+> **Status.** Direction changed to BwK. Everything marked **PROPOSED** is a design that is *not approved and not implemented yet*. Rationale for earlier decisions: `docs/design_decisions.md` (sec. 13–16: adaptive Bob, snapshots, re-simulation). Notation: `docs/notation.md`.
 
 ---
 
 ## 1. Research summary
 
+**Research questions**
+- **RQ1.** In a repeated all-pay auction with a global budget and a changing environment, how do BwK algorithms (stationary, non-stationary, adversarial) compare with bandit algorithms that are *not* budget-aware (EXP3, ELP, UCB1)?
+- **RQ2.** Against an opponent that reacts to the agent's own policy, do the theoretical non-stationarity measures of non-stationary BwK (local `V`, global `W`) remain meaningful when the non-stationarity is *caused by the agent*?
+
 | | |
 |---|---|
-| **Base theory** | Waniek et al. (2016): the repeated dollar auction as an adversarial MAB; ELP with prefix side-information (Lemma 1). |
-| **What we add** | (1) an **adaptive adversary** (Bob) whose regime depends on the learner's recent play; (2) **switching/dynamic regret** as the benchmark; (3) **EXP3.S + Page-Hinkley** reset as change-responsive learner; (4) a **computational-resource-contention** domain (EC2 spot bidding); (5) an **N-player** extension. |
-| **Arm set `S0`** | The *threshold strategy family* (Waniek Sec. 5.2): `f_θ` follows O'Neill's optimal strategy until the opponent's bid reaches θ, then passes. One arm per θ ∈ {0,…,b}. |
-| **Reward** | Continuous, normalized to [0,1] (`DollarAuction.normalize_reward`), never binary win/lose. |
+| **Base** | Waniek et al. 2016: ELP with prefix side-information (Lemma 1), threshold strategies, deterministic opponent, static regret, **budget reset every auction**. |
+| **Known, therefore not our contribution** | *Non-stationary BwK* (Liu, Jiang & Li 2022): dynamic benchmark, measures `V1,V2,W1,W2`, Sliding-Window UCB-BwK. |
+| **Our angle** | all-pay auction structure + **reactive opponent** + empirical study in a compute-contention simulator. Result type: **empirical**, not new theorems. |
+| **Arm set `S0`** | Unchanged: threshold strategies `f_θ`, θ ∈ {0,…,b} (Waniek Sec. 5.2). **θ = 0 is the null arm** (never bids). |
+| **Budget protocol** (PROPOSED) | `B = ρ·T`, one resource (`d = 1`, money). Play stops at the first round whose cost would exceed the remaining budget; that round earns nothing (Liu et al.). |
+| **Reward / cost** (PROPOSED) | `reward = 1{win}` (stake won, normalized), `cost = final_bid / b` (all-pay: paid even when losing). Stage 3 adds a VM cost when winning. Stages 0–1 keep the old net-payoff reward ("reset mode"). |
 
-### Theoretical scope (read before writing claims)
-- **Proven in the paper:** ELP achieves Õ(√T) **static** regret on the threshold family (Thm 6 / Cor 7), because playing a high-θ arm reveals the outcome of all lower-θ arms (prefix property, Lemma 1).
-- **Not proven (our empirical contribution):** any guarantee for EXP3, EXP3.S, or EXP3.S+Page-Hinkley against Bob, or for **switching** regret. Present these as hypotheses tested by simulation.
-- **Adaptive Bob ⇒ policy-regret flavour.** The learner's own play changes Bob's future behaviour, so a counterfactual "arm g all along" must be **re-simulated** from a Bob snapshot (sec. 16). Bob's rolling window gives him bounded memory, which is what keeps this meaningful.
-- **To verify before citing:** Thm 6 claims α(G)=1 for the (directed) side-information graph; check that the cited ELP theorem covers directed graphs.
-- ELP's Lemma-1 replay stays valid *within a round* (Bob's regime is fixed before the auction starts) but not across rounds (sec. 14).
+### Theoretical scope
+- **Proven in Waniek:** ELP achieves Õ(√T) static regret on the threshold family (Thm 6) under an oblivious opponent and per-auction budgets.
+- **Proven in Liu et al. (checked against the PDF):** Reg ≤ Õ((1/b)√(mT) + m^{1/3}V1^{1/3}T^{2/3} + (1/b)m^{1/3}d·V2^{1/3}T^{2/3} + W1 + q̄W2), `q̄ ≤ 1/b`, with matching lower bounds. Their model treats the distribution sequence `P_t` as fixed in advance (the benchmark is defined with all `P_t` known; `V, W` are computed from fixed sequences). They never state "oblivious" for BwK itself; their OCOwC appendix explicitly allows adaptive deterministic constraints, a different problem.
+- **Not covered by any theorem we have:** BwK algorithms against a *reactive* Bob. If `P_t` depends on the agent's past play, `V` and `W` become policy-dependent. Whether the bound still holds pathwise against the realized sequence is **our conjecture, unverified**.
+- **Unverified items:** Thm 6's claim α(G)=1 for the *directed* prefix graph (Alon et al. results for directed graphs should be checked); novelty of the combination (all-pay + BwK + reactive opponent + policy regret); standard Hedge/Exp3/Exp3.S bounds (not in the attached papers).
 
 ---
 
-## 2. Roadmap (three phases)
+## 2. BwK in a nutshell
+Each round the learner plays an arm and gets a **reward** *and* consumes **resources** from a total budget `B`; the game ends when the budget runs out or after `T` rounds; an arm with reward 0 and cost 0 (**null arm**) always exists. Optimal behaviour is usually a **mixture of arms**, found by a linear program:
 
-| Phase | Setting | Environment | Status |
+```
+maximize   Σ_i  reward_i · x_i          x = distribution over arms (incl. null arm)
+subject to Σ_i  cost_i   · x_i ≤ ρ = B/T
+```
+
+With `d = 1` this means: play the arm with the best reward/cost ratio as often as the budget allows, fill the rest with the null arm. Sliding-Window UCB-BwK replaces the unknown means by windowed optimistic (reward) / pessimistic (cost) estimates and solves this LP every round. The budget couples all rounds, which is why *local* change measures are not enough and Liu et al. introduce the *global* `W`.
+
+---
+
+## 3. Roadmap
+
+| Stage | Setting | Budget | Opponent | Status |
+|---|---|---|---|---|
+| **0** | Replicate Waniek: ELP, static regret | reset per auction | Alice (deterministic) | ✅ done |
+| **1** | Adaptive Bob, no global budget (policy-regret findings) | reset per auction | Bob | 🔧 infrastructure + sweeps done, experiment not run |
+| **2a** | BwK validation: do BwK algorithms approach the stationary LP benchmark? | **global** | Alice | PROPOSED |
+| **2b** | BwK vs. reactive Bob; policy regret; endogenous `V̂, Ŵ` | **global** | Bob (+ `w=0` control) | PROPOSED |
+| **3** | EC2 layer: AR(1) background price with epochs (exogenous non-stationarity), VM cost | **global** | Alice, Bob | PROPOSED |
+| future | N-player population | — | — | out of scope |
+| optional | Swoopo (penny auction) as empirical evidence that escalation exists | — | — | undecided |
+
+Stage 2a exists to separate *bugs* from *phenomena*: without a stationary sanity check you cannot interpret results against Bob.
+
+---
+
+## 4. Algorithms (PROPOSED set)
+
+| Family | Algorithm | Source | Role |
 |---|---|---|---|
-| **Phase 1** | 1v1 synthetic: Learner (MAB) vs. Bob (adaptive adversary) | abstract Dollar Auction (`dollar_auction.py`) | in progress |
-| **Phase 2** | 1v1 EC2 spot simulator | Computational Resource Contention model based on Khandelwal et al. (ICCUBEA 2018) | planned |
-| **Phase 3** | N-player MAS: N agents, each running a MAB algorithm, compete in a shared compute pool | N-player contention engine | planned |
+| BwK, stationary | **UCB-BwK** | Agrawal & Devanur 2014 | optimistic reward, pessimistic cost, LP each round |
+| BwK, non-stationary | **SW-UCB-BwK** | Liu et al. 2022, Alg. 1 | windows `w1` (reward), `w2` (cost); tuned by grid since `V` is unknown/endogenous |
+| BwK, adversarial | **LagrangeBwK** | Immorlica et al. 2019 | black-box reduction to an adversarial bandit algorithm; needs an estimate of OPT |
+| non-BwK baseline | **EXP3** | Auer et al. 2002 | adversarial, no side-information |
+| non-BwK baseline | **ELP** | Waniek 2016 / Mannor–Shamir 2011 | adversarial + prefix side-information (the Waniek link) |
+| non-BwK baseline | **UCB1** | classical | stochastic assumption |
 
-Experiment folders map onto phases:
+- Non-BwK baselines run under the **same stopping rule** ("play until the budget is exhausted"); one pacing variant (`cost ≤ B/T` per round) may be added for the best of them. All algorithms get equal hyper-parameter tuning effort.
+- **Legacy, kept but not in the main experiments:** EXP3.S, Page-Hinkley (`page_hinkley.py`, tested), `ELP` without `reset()`. They stay in the repo so Stages 0–1 remain reproducible.
+- Optional if time allows: PrimalDualBwK (Badanidiyuru et al. 2013), EXP3-based BwK for `d=1` (Rangi et al. 2018).
+- SMPyBandits provides classical single-player bandits only; **we found no BwK policy there** (not confirmed by inspection). Write BwK ourselves (`scipy.optimize.linprog`, ~100 lines each).
 
-| Phase | Folder | Purpose |
+---
+
+## 5. Evaluation design (PROPOSED)
+
+| Situation | Benchmark | Valid because |
 |---|---|---|
-| 1 | `experiments/stage0_baseline_replication/` | Validate our ELP against the paper's setting (rational, oblivious opponent; static regret). **Standalone script, frozen.** |
-| 1 | `experiments/stage1_adaptive_1v1/` | ELP vs EXP3 vs EXP3.S vs EXP3.S+PH against the **adaptive Bob**, 1v1. Bob scenarios (slow / fast reaction: window `W`, `min_dwell`, gain) are *configurations of one experiment*, not separate stages. |
-| 2 | `experiments/stage2_ec2_spot/` | 1v1 on the spot-market simulator. |
-| 3 | `experiments/stage3_nplayer/` | N-player contention. |
-| — | `experiments/stage_optional_swoopo/` | *Optional / undecided:* Swoopo penny-auction validation (dropped from the core roadmap pending advisor decision). |
+| Exogenous epochs (Stage 3, Alice) | **Dynamic LP** of Liu et al. with the generator's true per-epoch means | `P_t` fixed in advance |
+| Reactive Bob (Stage 2b) | **Policy regret vs. best fixed distribution**, re-simulated from t = 1 against a deep copy of Bob under the same budget/stop rule. With `d=1` candidates are "one arm × fraction of rounds played" (≈130) | the comparator's own play changes Bob, so it must be re-simulated |
+| Reactive Bob, diagnostics | (a) best fixed arm, (b) regime-aware oracle, (c) **realized `V̂, Ŵ`**: freeze Bob at its actual state each round, estimate each arm's mean reward/cost by Monte-Carlo (a *within-round* counterfactual), then compute `V, W` along the realized path | does not use the forbidden multi-round counterfactual |
 
-> **Numbering changed.** Old README: Stage 2 = N-player, Stage 3 = Swoopo. Now: Phase 2 = EC2 1v1, Phase 3 = N-player. `design_decisions.md` sec. 7, 11, 17, 19–20 still use the old numbering and need updating.
+Metrics: total reward until budget exhaustion, ratio to benchmark, budget utilisation, escalation frequency, external vs. policy regret, **adaptivity index** (their gap), and whether `V̂, Ŵ` differ across algorithms on the *same* instance (direct evidence of endogeneity). Controls: Bob with no memory (see Open decisions #7). Report 30–50 seeds, explicit seeds, mean ± CI; report negative results as they are.
 
-**Stage 1a/1b were merged into one stage.** They only made sense for the old scripted Bob (single vs. recurring *fixed* switch times). With the adaptive Bob, escalation times are an outcome of play (sec. 15), so "rare vs. frequent switching" is just a Bob configuration (e.g. large `W` + large `min_dwell` vs. small `W` + small `min_dwell`). Run both as scenarios inside `stage1_adaptive_1v1` and report the realized switch-time distribution across seeds. `design_decisions.md` sec. 6 and 15 still mention 1a/1b and need updating.
+**Never** use per-round counterfactual rewards of *other arms* to score a whole trajectory against Bob.
 
 ---
 
-## 3. Agents (terminology — important)
-
-- **Learner ("Alice" in the thesis text)** — rational MAB agent; chooses a threshold arm θ each round with ELP / EXP3 / EXP3.S / EXP3.S+PH. In code this is the *learner/agent*.
-- **Bob** — **adaptive adversary**, not a learner. Fixed, hand-designed reaction rule that is **history-dependent**: a rolling window (size `W`) of the learner's aggressiveness (e.g. θ/b) → `p_escalate` → per-round regime draw (Rational / Escalating). While escalating, within-auction sunk-cost dynamics apply (probabilistic continuation past a sunk-cost threshold, up to a ceiling). Extra parameters: `prior_sunk_cost` (investment Bob brings into each auction — without it he only gets hooked after *he* bids, so when the learner opens he folds like a rational player and the regimes barely differ), `min_history` (Bob does not react until his window is full), `min_dwell` (persistent regimes), and `fixed_regime` (oracle Bob for calibration only).
-- **Rational opponent** (`alice_rational.py`, class `Alice`) — the oblivious fixed-rule opponent used only in Stage 0. ⚠ *Name clash with the thesis's "Alice".* Recommended: rename file/class to `rational_opponent.py` / `RationalOpponent`.
-
-Why "adaptive" matters: the reward may depend on the learner's *previous-round* choices, which is exactly what justifies adversarial-bandit methods over non-stationary *stochastic* ones (sec. 1). Within-auction reactivity does not count (sec. 13).
+## 6. Agents (terminology)
+- **Learner** — *our* agent, the only one that learns; chooses an arm θ each round.
+- **Alice** (`alice_rational.py`) — an **opponent**: deterministic and oblivious (raises while the next bid ≤ `mu·stake`, then folds).
+- **Bob** (`bob_sunkcost.py`) — **adaptive opponent**: regime (Rational/Escalating) drawn each round from `p_escalate = clip(gain · mean(window of the learner's aggressiveness))`; while escalating, sunk-cost dynamics apply. Parameters: `window`, `min_history`, `min_dwell`, `gain`, `prior_sunk_cost`, `escalation_rate`, ceiling, `fixed_regime` (calibration only). Snapshot-safe.
 
 ---
 
-## 4. Domain mapping: Dollar Auction → EC2 spot instances
-
-Source: Khandelwal, Chaturvedi & Gupta, *Bidding Strategies for Amazon EC2 Spot Instances — A Comprehensive Review* (ICCUBEA 2018).
-
-| Dollar Auction | Compute / spot-instance meaning |
+## 7. Domain mapping (EC2-style contention) and honest caveats
+| Auction | Compute setting |
 |---|---|
-| Stake `s` | Value of completing the job on contested spot capacity |
-| Bid `x` | Bid price / compute committed for the spot instance |
-| Threshold `θ` | **Bid cap** — the highest price the user will chase |
-| Budget `b` | Maximum affordable bid (e.g. on-demand price or above) |
-| All-pay / sunk cost | **Out-of-bid termination**: price rises above the bid, the instance is revoked, un-checkpointed work is lost and must be redone |
-| Bob's escalation | A user protecting accumulated progress by raising bids (sunk-cost fallacy) |
+| stake | value of completing the job on contested capacity |
+| bid / θ | bid commitment / bid cap |
+| global budget `B` | total spending allowance across jobs |
+| all-pay cost | out-of-bid termination: un-checkpointed progress is lost |
+| Bob's `prior_sunk_cost` | progress already invested, which the user tries to protect |
 
-The review's static bidding strategies (Bid Min, Mean, On-Demand 30 %, 70 %, On-Demand, Max) are natural candidates for the Phase-2 θ grid, and its job-size / price-volatility suitability table (Table 1) can parametrize scenarios.
-
-**Modelling caveats (state them in the thesis):**
-1. In real EC2 the user pays the *market* price, not their bid, and a partial hour ended by the provider is not billed. The all-pay property therefore applies to **lost work**, not to bid payment. Phase 2 must define the cost model explicitly.
-2. AWS replaced bidding with simplified pricing in 2018 (ref. [23] of the review). Phase 2 models the legacy market stylistically.
-3. The ICCUBEA paper is a literature review (it summarizes strategies proposed in other works; its only own empirical part is an analysis of EC2 price traces whose data/method are not released). Use it for qualitative structure and parametrization, not as a dataset.
-4. **Price traces cannot validate auction dynamics.** A trace contains the exogenous market price, not competitors' bids, so a dollar-auction/escalation process cannot be replayed or validated from it. Phase 2 is therefore a **model-based simulator**; traces are optional, only to make the price process realistic (e.g. trace-driven background price).
-5. Ben-Yehuda et al. (the work cited as [22] in the review) report that legacy EC2 spot prices were usually *not* market-driven but drawn at random from a tight interval via a dynamic hidden reserve price (their CloudCom 2011 paper; confirm the claim in the journal version before citing). So the legacy market was not a genuine N-bidder auction either: our all-pay/escalation mapping is a **stylized scenario**, and the thesis should say so.
-
-**Public data that exists (optional use):** Calvin Ardi's *Amazon EC2 Spot Price History* (2014–2015 and 2017–2023; https://ant.isi.edu/~calvin/data/ec2-spot-price/, also on Zenodo). Only the 2014–2015 part is clearly from the bidding era; later years follow the 2018 pricing change.
+1. **All-pay is our modelling assumption.** Real EC2 charged the market price, not the bid, and did not bill the interrupted partial hour.
+2. Ben-Yehuda et al. (2013): ~98 % of the time legacy spot prices came from a hidden-reserve-price AR(1) process, not from competing bids; prices say little about real bids. Hence **competition is simulated, not read from data**.
+3. **Price generator (Stage 3):** truncated AR(1) in a band `[F, C]` (fractions of the on-demand price): `P_i = P_{i-1} + Δ_i`, `Δ_i = −0.7·Δ_{i-1} + ε(σ = 0.39·(C−F))`, epochs = changes of `(F, C)`. Cost parameters from Abundo et al. Use a *calibrated generator*, not an old trace. Real traces (Ardi's archive) are optional input for calibration only.
+4. Traces contain prices, not opponents' bids, so they cannot validate escalation.
 
 ---
 
-## 5. Project structure
+## 8. Literature map
+| Paper | Role |
+|---|---|
+| Waniek et al. 2016 | base theory, ELP, threshold family |
+| **Badanidiyuru et al. 2013; Slivkins book Ch. 10** | BwK definition and basics |
+| Agrawal & Devanur 2014 | UCB-BwK |
+| **Liu, Jiang & Li 2022** | non-stationary BwK, `V`/`W`, SW-UCB-BwK |
+| Immorlica et al. 2019 | adversarial BwK, LagrangeBwK |
+| Fikioris et al. (arXiv 2302.14686) | "approximately stationary" BwK: alternative non-stationarity notion; **check whether its adversary may depend on the agent's actions** (the abstract suggests dependence on previous rounds; not verified) |
+| Garivier & Moulines 2008 | sliding-window UCB |
+| Poland 2005; Arora, Dekel & Tewari 2012 (verify) | adaptive adversaries, policy regret |
+| Khandelwal 2018 (review); Ben-Yehuda 2013; Menache et al. 2014; Abundo et al. 2014 | EC2 domain: strategy families, price generator, learning bidders |
 
-Legend: ✅ done · 🔧 done, but still needs checking · ⬜ not yet written
+---
+
+'''## 9. Project structure
+Legend: exists and was confirmed · 🔧 exists, not yet confirmed · ⬜ planned · *(legacy)* kept and tested, but not in the main BwK experiments
 
 ```
 dollar-auction-bandit/
-├── README.md
-├── requirements.txt
-├── pytest.ini                         # ✅ pythonpath=. so tests can `import src...`
-├── .gitignore                         # must contain .venv/
+│
+├── README.md                              # ✅ overview, roadmap, decisions (kept current)
+├── requirements.txt                       # 🔧 mesa>=3.0, networkx, numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, pyyaml
+├── pytest.ini                             # ✅ pythonpath = .  (tests can `import src...`)
+├── .gitignore                             # ✅ must contain .venv/, results/, data/raw/
+│
+├── configs/                               # ⬜ one YAML per experiment grid
+│   ├── stage1_adaptive_1v1.yaml           # ⬜ Bob scenarios (window w, min_dwell, gain, escalation c)
+│   ├── stage2a_bwk_alice.yaml             # ⬜ algorithm × budget ρ=B/T, seeds
+│   ├── stage2b_bwk_bob.yaml               # ⬜ algorithm × Bob (w, c, w=0 control) × B
+│   └── stage3_ec2_layer.yaml              # ⬜ + AR(1) band/epoch parameters, EC2 feature flag
 │
 ├── src/
 │   ├── environment/
-│   │   ├── dollar_auction.py          # ✅ 2-player all-pay auction (Xb formalization)
-│   │   ├── strategies.py              # ✅ O'Neill + threshold strategies (arm set S0)
-│   │   ├── dollar_auction_nplayer.py  # ⬜ Phase 3
-│   │   └── spot_market.py             # ⬜ Phase 2 (resource-contention simulator)
+│   │   ├── dollar_auction.py              # ✅ 2-player all-pay auction (Xb formalization); mechanics unchanged under BwK
+│   │   ├── strategies.py                  # ✅ O'Neill + threshold family S0; θ = 0 is the null arm
+│   │   ├── outcomes.py                    # ⬜ from an AuctionResult: gross reward 1{win}, cost = final_bid / b
+│   │   ├── price_process.py               # ⬜ Stage 3: truncated AR(1) in [F, C] with epochs (Ben-Yehuda), VM cost
+│   │   └── dollar_auction_nplayer.py      # ⬜ future work (N-player)
 │   │
 │   ├── opponents/
-│   │   ├── alice_rational.py          # ✅ oblivious rational opponent (Stage 0)
-│   │   ├── bob_sunkcost.py            # 🔧 adaptive adversary (rolling window, snapshot-safe)
-│   │   └── population.py              # ⬜ Phase 3 heterogeneous population
+│   │   ├── alice_rational.py              # ✅ Alice: deterministic, oblivious opponent (Stage 0 baseline)
+│   │   ├── bob_sunkcost.py                # 🔧 Bob: adaptive opponent (rolling window, snapshot-safe, prior_sunk_cost,
+│   │   │                                  #    min_history, min_dwell, fixed_regime); memoryless-Bernoulli control ⬜
+│   │   └── population.py                  # ⬜ future work (heterogeneous N-player generator)
 │   │
 │   ├── algorithms/
-│   │   ├── base.py                    # ✅ interface: select_arm / update(info) / reset
-│   │   ├── elp.py                     # ✅ ELP (no reset() yet -> cannot be paired with PH)
-│   │   ├── exp3.py                    # ✅ EXP3
-│   │   ├── exp3s.py                   # ⬜ EXP3.S
-│   │   └── page_hinkley.py            # 🔧 direction fixed (detects reward DROP), warm-up added
+│   │   ├── base.py                        # ✅ interface: select_arm(), update(arm, reward, info), reset()
+│   │   ├── elp.py                         # ✅ ELP with Lemma-1 prefix side-information (baseline; ELP.reset ⬜)
+│   │   ├── exp3.py                        # ✅ classic EXP3 (baseline)
+│   │   ├── ucb1.py                        # ⬜ classical UCB1 (stochastic baseline)
+│   │   ├── budget_wrappers.py             # ⬜ optional: pacing (cost ≤ B/T), reward − λ·cost, for non-BwK baselines
+│   │   ├── exp3s.py                       # ⬜ (legacy) EXP3.S switching variant
+│   │   ├── page_hinkley.py                # 🔧 (legacy) change detector, reward-drop direction fixed
+│   │   └── bwk/
+│   │       ├── lp.py                      # ⬜ shared single-step LP helper (scipy.optimize.linprog, null arm)
+│   │       ├── ucb_bwk.py                 # ⬜ UCB-BwK (Agrawal & Devanur 2014)
+│   │       ├── sw_ucb_bwk.py              # ⬜ Sliding-Window UCB-BwK (Liu et al. 2022, Alg. 1; windows w1, w2)
+│   │       ├── lagrange_bwk.py            # ⬜ LagrangeBwK (Immorlica et al. 2019; needs OPT estimate)
+│   │       └── primal_dual_bwk.py         # ⬜ optional (Badanidiyuru et al. 2013)
 │   │
-│   ├── metrics/                       # NOTE: regret.py / detection_delay.py do NOT exist yet
-│   │   ├── plots.py                   # ✅ shared standard plot set (Stage 0 = baseline; later stages add layers)
-│   │   ├── regret.py                  # ⬜ per-phase switching regret (re-simulation from Bob snapshots)
-│   │   └── detection_delay.py         # ⬜ PH alarm round vs. realized Bob regime change
+│   ├── metrics/
+│   │   ├── plots.py                       # ✅ shared standard figure set (RunBundle); Stage 0 = baseline, later stages add layers
+│   │   ├── regret.py                      # ⬜ static regret; reward/cost until budget exhaustion; ratio to benchmark
+│   │   ├── benchmarks.py                  # ⬜ dynamic LP (Liu et al.) and empirical best-fixed-distribution grid
+│   │   ├── policy_regret.py               # ⬜ re-simulate whole trajectory from t=1 against a Bob snapshot
+│   │   ├── nonstationarity.py             # ⬜ realized V̂, Ŵ along the path (within-round Monte-Carlo, Bob frozen)
+│   │   └── detection_delay.py             # ⬜ (legacy) Page-Hinkley alarm vs. realized regime change
 │   │
 │   └── simulation/
-│       ├── config.py                  # 🔧 SimConfig dataclass (+ `stage1_config()` recommended starting point)
-│       ├── calibration.py             # 🔧 per-arm rewards vs. a regime-pinned Bob + separation score
-│       └── runner.py                  # 🔧 AuctionSimulation (pure core) + thin Mesa wrapper
+│       ├── config.py                      # 🔧 SimConfig (+ stage1_config()): every experiment parameter in one place
+│       ├── runner.py                      # 🔧 AuctionSimulation (pure core) + thin Mesa wrapper; records, phase_starts
+│       ├── calibration.py                 # 🔧 per-arm rewards vs. a regime-pinned Bob, separation score
+│       ├── budget.py                      # ⬜ budget_mode = "reset" (default) | "global"; stop rule; alive mask
+│       ├── yaml_config.py                 # ⬜ YAML → SimConfig grid expansion
+│       └── batch.py                       # ⬜ many seeds × algorithms in parallel (multiprocessing/joblib) with tqdm
 │
 ├── experiments/
-│   ├── stage0_baseline_replication/run_stage0.py   # ✅ standalone (no runner/Mesa); tqdm + shared plots + Thm-6 bound; `--quick` for a smoke run
-│   ├── calibrate_regimes.py           # 🔧 PRE-FLIGHT: one config at a time, with control rows
-│   ├── sweep_bob.py                   # 🔧 PRE-FLIGHT: grid search (Part A regime separation, Part B adaptive dynamics)
-│   ├── smoke_mesa.py                  # 🔧 end-to-end check of the Mesa wrapper
-│   ├── stage1_adaptive_1v1/           # ⬜ (merged 1a+1b; Bob scenarios as configs)
-│   ├── stage2_ec2_spot/               # ⬜
-│   └── stage3_nplayer/                # ⬜
+│   ├── stage0_baseline_replication/
+│   │   └── run_stage0.py                  # ✅ ELP vs Alice, static regret, Thm-6 bound, --quick (folder name on your machine may differ)
+│   ├── calibrate_regimes.py               # 🔧 pre-flight: does the best arm differ between Bob's regimes?
+│   ├── sweep_bob.py                       # 🔧 pre-flight: Part A regime separation, Part B adaptive dynamics
+│   ├── smoke_mesa.py                      # ✅ end-to-end check of the Mesa wrapper
+│   ├── calibrate_budget.py                # ⬜ per-arm (reward, cost) → choose ρ so the budget actually binds
+│   ├── stage1_adaptive_1v1/               # ⬜ adaptive Bob, per-auction budget reset (policy-regret findings)
+│   ├── stage2a_bwk_alice/                 # ⬜ BwK validation: stationary, vs. LP benchmark
+│   ├── stage2b_bwk_bob/                   # ⬜ BwK vs. reactive Bob: policy regret, V̂/Ŵ, adaptivity index
+│   ├── stage3_ec2_layer/                  # ⬜ AR(1) price epochs + VM cost; dynamic-LP benchmark applies
+│   └── stage_optional_swoopo/             # ⬜ undecided: empirical evidence that escalation exists
 │
 ├── tests/
-│   ├── test_environment.py            # ✅ 5 tests
-│   ├── test_opponents.py              # 🔧 6 tests (rewritten for the adaptive Bob)
-│   ├── test_page_hinkley.py           # 🔧 4 tests
-│   ├── test_bob_sunkcost.py           # 🔧 15 tests
-│   ├── test_runner.py                 # 🔧 10 tests
-│   ├── test_plots.py                  # 🔧 3 tests
-│   └── test_calibration.py            # 🔧 4 tests
+│   ├── test_environment.py                # ✅ auction mechanics, O'Neill, normalization
+│   ├── test_opponents.py                  # ✅ Alice; Bob within-auction behaviour
+│   ├── test_bob_sunkcost.py               # 🔧 regime/history, snapshot isolation, min_history, fixed_regime, prior_sunk_cost
+│   ├── test_page_hinkley.py               # ✅ (legacy) direction, auto-reset
+│   ├── test_runner.py                     # ✅ schema, reproducibility, independent RNG streams, phase snapshots
+│   ├── test_plots.py                      # ✅ standard figure set
+│   ├── test_calibration.py                # 🔧 separation score, prior_sunk_cost effect
+│   ├── test_outcomes.py                   # ⬜ reward/cost ranges; θ=0 gives (0, 0) vs. Alice and Bob
+│   ├── test_budget.py                     # ⬜ stop rule, reset mode == old behaviour, alive mask
+│   ├── test_bwk_lp.py                     # ⬜ LP on toy instances (ratio arm + null arm, d=1)
+│   ├── test_bwk_algorithms.py             # ⬜ UCB-BwK → stationary LP; SW-UCB-BwK window logic
+│   ├── test_benchmarks.py                 # ⬜ dynamic LP; fixed-distribution grid
+│   ├── test_policy_regret.py              # ⬜ re-simulation never mutates the live Bob
+│   └── test_nonstationarity.py            # ⬜ V̂, Ŵ on a known piecewise-constant instance
 │
-├── data/            # raw (read-only) / processed / synthetic
-├── results/         # per-stage figures and tables
-├── notebooks/       # exploration only
-└── docs/            # design_decisions.md, notation.md
+├── data/
+│   ├── raw/                               # read-only; optional external data (EC2 price archive, Swoopo), not committed
+│   ├── processed/                         # small derived artefacts (fitted AR(1) parameters, selected windows)
+│   └── synthetic/                         # optional saved simulation outputs
+├── results/                               # generated; one folder per stage (stage0/, sweeps/, stage1/, …), git-ignored
+├── notebooks/                             # exploration only, never final code
+└── docs/
+    ├── design_decisions.md                # ✅ must be kept current (sec. 6, 7, 11, 15, 17–20 still use the old stage numbering)
+    ├── notation.md                        # ✅ to extend with BwK symbols (B, ρ, d, m, V1, V2, W1, W2, q̄)
+    └── bwk_notes.md                       # ⬜ reading notes: Slivkins Ch. 10, Liu et al., Fikioris et al.
 ```
 
-### What the less obvious files are for
-- **`src/simulation/config.py`** — one `SimConfig` dataclass (budget, stake, T, seed, Bob parameters, Page-Hinkley parameters). The runner reads *only* from it, so an experiment is fully described by one object and nothing is hard-coded across files. Stage 1+ scripts build a `SimConfig`; Stage 0 predates it and keeps its own `CONFIGS` list.
-- **`src/simulation/runner.py`** — `AuctionSimulation` holds all simulation logic and randomness (testable without Mesa). `AuctionModel` (a `mesa.Model`) only calls `sim.step()` and lets `DataCollector` log. It also stores `phase_starts` (Bob snapshots) for hindsight regret. It does **not** compute regret.
-- **`experiments/calibrate_regimes.py`** — run it **before** any Stage 1 experiment. It plays every fixed θ against an always-rational Bob and an always-escalating Bob, and reports whether the best arm *differs* between the two regimes and how costly it is to use the wrong one (`score = min(A, B)`, reward units in [0,1]). If it does not, there is nothing for EXP3.S/PH to track: retune Bob, budget or stake. **`experiments/sweep_bob.py`** does this systematically: Part A searches (budget, stake, Bob `mu`, `prior_sunk_cost`, rate); Part B sweeps the adaptive parameters (window, `min_dwell`, gain) against a real learner and reports phase counts/lengths. Both write CSVs to `results/sweeps/`. Page-Hinkley threshold calibration (`calibrate_threshold`) belongs in the same pre-flight step.
-- **`experiments/smoke_mesa.py`** — a 200-round run through the Mesa path; fails loudly if the Mesa API usage is wrong.
+Design rules: `budget_mode = "reset"` stays the default so Waniek's replication keeps running; `dollar_auction.py` and `strategies.py` do not change for BwK; the **runner owns the stopping rule**, algorithms never see the remaining budget.
 
 ---
 
-## 6. Conventions
+'''
 
-### Algorithm interface (`src/algorithms/base.py`)
-```python
-class BanditAlgorithm:
-    def select_arm(self) -> int: ...
-    def update(self, arm: int, reward: float, info: dict | None = None) -> None: ...
-    def reset(self) -> None: ...      # required for use with Page-Hinkley
-```
-`info={"agent_state_trace": ...}` is read only by ELP (Lemma-1 replay); EXP3-family ignores it. The runner always passes it.
 
-### Per-round order (do not reorder — it keeps Bob's regime a function of history up to t−1)
-```
-snapshot Bob → bob.begin_round() → select_arm → run auction → update(arm, reward, info)
-→ bob.observe_agent_move(signal) → detector.update(reward) → (alarm ⇒ algorithm.reset())
-```
+## 10. Conventions
 
-### Hindsight / counterfactual rule
-Any hindsight computation against Bob **must** use a deep-copied snapshot (`bob.snapshot()`), never the live Bob. Do not cache `bob.get_strategy()` closures on an instance (deepcopy would leave them pointing at the original). Covered by `tests/test_bob_sunkcost.py` and `tests/test_runner.py`.
+**Algorithm interface.** `select_arm() -> int`; `update(arm, reward, info=None)`; `reset()` optional. For BwK the cost travels in `info["cost"]` (no signature change); ELP still reads `info["agent_state_trace"]`. Algorithms do not see the remaining budget — SW-UCB-BwK uses `ρ = B/T`; the **runner owns the stopping rule**. Because the horizon is random (stopping time τ ≤ T), results are padded with an `alive` mask.
 
-### Randomness & reproducibility
-One `seed` per run → `SeedSequence.spawn(3)` → three **independent** generators: learner, Bob, environment (starting player). Bob's RNG is private; hindsight code never touches live generators. Report means ± CI over many seeds, never single runs.
+**Per-round order** (keeps Bob's regime a function of history up to t−1): snapshot Bob → `begin_round` → `select_arm` → auction → compute reward & cost → budget check/stop → `update` → `bob.observe_agent_move`.
 
-### Logged data (Mesa `DataCollector`)
-Model level: `Round`, `Bob_Regime`, `P_Escalate`, `Winning_Bid`, `Cumulative_Reward`, `PH_Detected`.
-Agent level: `Agent_ID`, `Chosen_Arm`, `Reward`.
-`Cumulative_Regret` is **computed post-hoc** by `src/metrics/regret.py` from the records and Bob snapshots (it needs re-simulation, so it is not a per-step column).
+**Hindsight rule.** Any counterfactual against Bob uses `bob.snapshot()`, never the live Bob; never cache `get_strategy()` closures.
+
+**Randomness.** One seed per run → `SeedSequence.spawn` → independent learner / Bob / environment streams.
+
+**Logged data** (Mesa `DataCollector`): model level `Round, Bob_Regime, P_Escalate, Winning_Bid, Cumulative_Reward, PH_Detected`; agent level `Agent_ID, Chosen_Arm, Reward`. Regret is post-hoc.
 
 ---
 
-## 7. Environment setup & running
-
+## 11. Setup & running
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\Activate.ps1
+python3 -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
 pip install --upgrade pip
-pip install "mesa>=3.0" networkx numpy pandas matplotlib seaborn scipy tqdm pytest
+pip install "mesa>=3.0" networkx numpy pandas matplotlib seaborn scipy tqdm pytest pyyaml
 ```
-`requirements.txt`: `mesa>=3.0, networkx (Mesa 3.5 imports it but does not declare it), numpy, pandas, matplotlib, seaborn, scipy, tqdm, pytest, jupyter`. **SMPyBandits** is optional (baseline UCB only, later); it is old and may conflict with Mesa 3 / recent NumPy, so install it last and drop it if it does.
+`networkx` is needed because Mesa 3.5 imports it without declaring it. `pyyaml` is for configs. SMPyBandits is optional (old; may conflict with recent Python/NumPy).
 
 ```bash
-pytest -v                                                      # expect 47 passed
-python -m experiments.smoke_mesa                               # Mesa wrapper check
-python -m experiments.calibrate_regimes                        # before Stage 1
-python -m experiments.sweep_bob --part A                       # search Bob/auction parameters
-python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replication
+pytest -v
+python -m experiments.smoke_mesa
+python -m experiments.calibrate_regimes
+python -m experiments.sweep_bob --part A
+python -m experiments.stage0_baseline_replication.run_stage0
 ```
-
-### Tooling policy
-- **Custom engine** is the core (auction, bandits, regret, detection).
-- **Mesa 3.0+** only for orchestration and `DataCollector` — no spatial grid. Agents are `Agent(model)` (no `unique_id`), no `mesa.time` schedulers.
-- **SMPyBandits** only for single-player baseline algorithms; its multi-player algorithms target collision problems and do not fit.
-- **tqdm** for progress bars in experiment drivers.
+Tooling: custom engine = core; Mesa = orchestration/logging only; tqdm in experiment drivers.
 
 ---
 
-## 8. Open decisions
-
-| # | Decision | Where it matters |
-|---|---|---|
-| 1 | Bob `min_dwell` (1 = per-round redraw as in sec. 13; >1 = persistent phases). Part B suggests 25–50 gives tens of phases per 4000 rounds | Per-phase hindsight needs persistent phases |
-| 2 | Aggressiveness signal: `θ/b` (sec. 13) vs. observable `final_bid/b` | Realism of Bob's information |
-| 3 | ~~Bob/budget/stake tuning~~ **Resolved by `prior_sunk_cost`**: recommended start `stage1_config()` = b=12, s=8, Bob mu=0.5, prior=3, rate=3 (cross-regime loss ≈0.15; Rational → best arms θ≥2, Escalating → θ=0). Old Bob ≈0.03–0.06 | Needs your sign-off: it adds a parameter to sec. 13's Bob |
-| 4 | Phase-2 cost model (what is "paid" when out-bid) | Validity of the all-pay mapping |
-| 5 | N-player payment rule and turn order (sec. 7) | Phase 3 |
-| 6 | Keep or drop Swoopo validation | Scope |
-| 7 | Asymmetric-cost regret (sec. 18) | Optional extension |
-| 8 | **Bob's regime is endogenous** (see Findings below): decide whether to keep it, add an exogenous component, or change the learner/benchmark | Determines whether EXP3.S + Page-Hinkley can show an advantage at all |
-
----
-
-## 8b. Findings from the Bob sweep (adaptive Bob, b=12, s=8, mu=0.5, prior=3, rate=3; T=3000, 3 seeds)
-
+## 12. Findings so far (Stage 1 sweep; b=12, s=8, Bob mu=0.5, prior=3, rate=3; T=3000, 3 seeds — indicative)
 | Policy | Mean reward |
 |---|---|
-| EXP3 (uniform-ish play, θ≈6) / ELP | ≈ 0.575 |
+| EXP3 / ELP | ≈ 0.575 |
 | best **fixed** arm (θ=2) | 0.684 |
-| oracle tracker (knows Bob's regime: θ=2 when Rational, θ=0 when Escalating) | 0.727 |
+| regime-aware oracle (θ=2 when Rational, θ=0 when Escalating) | 0.727 |
 
-- Bob escalates in proportion to the learner's own average θ/b, so a *moderately cautious* fixed arm already keeps Bob mostly rational (θ=2 ⇒ Bob escalating ≈16 % of rounds; θ=12 ⇒ 99 %).
-- EXP3/ELP do not find θ=2: reward per round looks best for aggressive arms *in the current regime*, but aggression **causes** later escalation. Their gap to the best fixed arm (≈0.11 per round) is a *policy-regret* effect; it grows with T. The value of perfect regime tracking over the best fixed arm is small here (≈0.04).
-- Window `W` (25 vs 100) and `min_dwell` hardly change this; they only change how long phases last (`min_dwell`≈25 → ≈80 phases per 4000 rounds).
-- Consequences to decide on (Open decision #8): (a) report best-fixed-arm and oracle-tracker as reference lines in every Stage 1 plot (cheap, valuable either way); (b) frame the thesis question as external vs. policy regret against a bounded-memory adaptive adversary; (c) add an *exogenous* regime component (e.g. background demand shocks, natural for the EC2 setting) so that tracking becomes valuable; (d) blocking-style learners (Arora, Dekel & Tewari, 2012 — verify before citing) as a known remedy for policy regret with bounded memory.
+Bob escalates in proportion to the learner's own aggressiveness, so a moderately cautious fixed arm keeps him mostly rational (θ=2 ⇒ ≈16 % escalating rounds; θ=12 ⇒ 99 %). EXP3/ELP do not find it: aggression looks good *this round* but causes later escalation. The gap (≈0.11/round) is a **policy-regret** effect; the value of perfect tracking over the best fixed arm is small (≈0.04). This is the empirical seed of RQ2.
 
 ---
 
-## 9. Collaboration
+## 13. Open decisions
+| # | Decision |
+|---|---|
+| 1 | Resources: `d = 1` (money) only, or a second resource? (with `d = 1` BwK reduces to a reward/cost ratio index + null arm) |
+| 2 | Budget level `ρ = B/T`: must be **below** the cost of the best-ratio arm for the constraint to bind (illustration: in the Stage-0 config the winning arms pay ≈0.3 of `b` per round). Needs `calibrate_budget.py` |
+| 3 | Null arm = θ = 0 (verify reward 0 / cost 0 against Alice and Bob) or an explicit "skip auction" arm |
+| 4 | Extra arm dimension (own-bid cap κ)? Not needed initially; the LP already meters spending |
+| 5 | Non-BwK baseline set (EXP3, ELP, UCB1) and the budget-handling variants applied to them |
+| 6 | Regret scheme of sec. 5 (re-simulation cost ≈ 10⁵–10⁶ auctions per run) |
+| 7 | Bob control: `window = 0` is not constructible; add a **memoryless Bernoulli regime** with fixed p (same escalation frequency, no reaction) |
+| 8 | Bob `min_dwell`, aggressiveness signal (`θ/b` vs `final_bid/b`) |
+| 9 | LagrangeBwK: how to estimate OPT (the Liu et al. experiments plug in the exact value) |
+| 10 | Stage 3: how epochs enter (cost → `V2/W2`, reward → `V1/W1`, or both) and the VM-cost definition |
+| 11 | Which branch is the base for `feature/bwk` (GitHub `main` is an older snapshot) |
 
-- Branches per feature/stage (`feature/exp3s`, `experiment/stage1a`); PR + review before merging to `main`; descriptive commits referencing the phase/stage.
-- Keep `docs/design_decisions.md` current — log every decision when it is made.
+---
+
+## 14. Reading list (in order)
+| # | Read | Parts | Depth |
+|---|---|---|---|
+| 1 | Slivkins, *Introduction to Multi-Armed Bandits* (arXiv 1904.07272) | **Ch. 10 (BwK)** | full chapter |
+| 2 | **Liu, Jiang & Li 2022** (arXiv 2205.12427) | Sec. 1–3, Appendix A (experiments) | skip proofs (App. B–F) |
+| 3 | Agrawal & Devanur 2014 | the UCB-BwK algorithm | only what you implement |
+| 4 | Fikioris et al. (arXiv 2302.14686) | Sec. 1–3: model, stationarity notion, **definition of the adversary** | targeted |
+| 5 | Slivkins Ch. 5–6; Poland 2005; Arora–Dekel–Tewari 2012 | adaptive adversaries, policy regret | concepts |
+| 6 | Immorlica et al. 2019 | only if LagrangeBwK is implemented | algorithm section |
+| later | Ben-Yehuda, Menache, Abundo, Khandelwal | Stage 3 | already read once |
+
+---
+
+## 15. Collaboration & progress
+Branches per feature (`feature/bwk`), PR + review before merging to `main`; keep `docs/design_decisions.md` current.
 
 | Member | Responsibility |
 |---|---|
@@ -253,43 +320,26 @@ python -m experiments.stage0_baseline_replication.run_stage0   # Stage 0 replica
 | **B** | |
 | **Both** | |
 
----
-
-## 10. Progress
-
-**Phase 1**
-- [x] Stage 0 — ELP baseline replication vs. rational opponent
-- [x] Page-Hinkley direction fix (+ warm-up)
-- [x] Bob rewritten as adaptive adversary (rolling window, snapshot-safe)
-- [x] `runner.py` / `config.py` (core tested; Mesa wrapper pending `smoke_mesa`)
-- [ ] `exp3s.py`, `ELP.reset()`
-- [ ] `regret.py` (per-phase hindsight), `detection_delay.py`
-- [ ] Regime calibration (`calibrate_regimes.py`) → choose Stage 1 scenario parameters
-- [ ] Stage 1 (adaptive Bob, 1v1; slow/fast Bob scenarios)
-
-**Phase 2** 
-- [ ] spot-market simulator 
-- [ ] Stage 2 experiments
-
-**Phase 3** 
-- [ ] N-player engine 
-- [ ] population generator 
-- [ ] Stage 3 experiments
+- [x] Stage 0 · [x] adaptive Bob + snapshots · [x] runner/Mesa wrapper · [x] plots · [x] regime calibration tooling
+- [ ] Stage 1 experiment · [ ] `outcomes.py` + `budget.py` · [ ] UCB-BwK · [ ] SW-UCB-BwK · [ ] baselines under budget · [ ] Stage 2a · [ ] regret/policy-regret/`V̂,Ŵ` · [ ] Stage 2b · [ ] Stage 3
 
 ---
 
-## 11. Key references
-
-1. Waniek, M., Tran-Thanh, L., & Michalak, T. (2016). *Repeated Dollar Auctions: A Multi-Armed Bandit Approach.* AAMAS 2016.
-2. Khandelwal, V., Chaturvedi, A. K., & Gupta, C. P. (2018). *Bidding Strategies for Amazon EC2 Spot Instances — A Comprehensive Review.* ICCUBEA 2018.
-3. Auer, P., Cesa-Bianchi, N., Freund, Y., & Schapire, R. E. (2002). *The Nonstochastic Multiarmed Bandit Problem.* SIAM J. Computing 32(1). (EXP3, EXP3.S)
-4. Mannor, S., & Shamir, O. (2011). *From Bandits to Experts: On the Value of Side-Observations.* NeurIPS. (ELP)
-5. Poland, J. (2005). *FPL analysis for adaptive bandits.* SAGA'05. (extends the regret argument to adaptive adversaries; cited in Waniek footnote 2)
-6. O'Neill, B. (1986). *International Escalation and the Dollar Auction.* J. Conflict Resolution 30(1).
-7. Besbes, O., Gur, Y., & Zeevi, A. (2014). *Stochastic Multi-Armed-Bandit Problem with Non-stationary Rewards.* NeurIPS.
-8. Garivier, A., & Moulines, E. (2011). *On Upper-Confidence Bound Policies for Switching Bandit Problems.* ALT.
-9. Guo, W., Chen, K., Wu, Y., & Zheng, W. (2015). *Bidding for Highly Available Services with Low Price in Spot Instance Market.* HPDC '15.
-10. Zaman, S., & Grosu, D. (2013). *Combinatorial auction-based allocation of virtual machine instances in clouds.* J. Parallel and Distributed Computing 73(4).
-11. Karunakaran, S., & Sundarraj, R. P. (2015). *Bidding Strategies for Spot Instances in Cloud Computing Markets.* IEEE Internet Computing 19(3).
-12. Kushwaha, V., & Simmhan, Y. (2014). *Cloudy with a Spot of Opportunity: Analysis of Spot-Priced VMs for Practical Job Scheduling.* CCEM 2014.
-13. *(Optional, Swoopo)* Byers, J., Mitzenmacher, M., & Zervas, G. (2010). *Information Asymmetries in Pay-Per-Bid Auctions: How Swoopo Makes Bank.* · Augenblick, N. (2015). *The Sunk-Cost Fallacy in Penny Auctions.*
+## 16. References
+1. Waniek, Tran-Thanh & Michalak (2016). *Repeated Dollar Auctions: A Multi-Armed Bandit Approach.* AAMAS.
+2. Badanidiyuru, Kleinberg & Slivkins (2013). *Bandits with Knapsacks.* FOCS.
+3. Agrawal & Devanur (2014). *Bandits with concave rewards and convex knapsacks.* EC.
+4. Immorlica, Sankararaman, Schapire & Slivkins (2019). *Adversarial Bandits with Knapsacks.* FOCS.
+5. Liu, Jiang & Li (2022). *Non-stationary Bandits with Knapsacks.* arXiv:2205.12427.
+6. Rangi, Franceschetti & Tran-Thanh (2018). *Unifying the stochastic and the adversarial bandits with knapsack.* arXiv:1811.12253.
+7. Slivkins (2019). *Introduction to Multi-Armed Bandits.* arXiv:1904.07272.
+8. Fikioris et al. (2023). *Approximately Stationary Bandits with Knapsacks.* arXiv:2302.14686 (author list to be confirmed).
+9. Auer, Cesa-Bianchi, Freund & Schapire (2002). *The Nonstochastic Multiarmed Bandit Problem.* SICOMP.
+10. Mannor & Shamir (2011). *From Bandits to Experts: On the Value of Side-Observations.* NeurIPS.
+11. Garivier & Moulines (2008). *On Upper-Confidence Bound Policies for Non-Stationary Bandit Problems.* arXiv:0805.3415.
+12. Poland (2005). *FPL analysis for adaptive bandits.* SAGA.
+13. O'Neill (1986). *International Escalation and the Dollar Auction.* J. Conflict Resolution.
+14. Agmon Ben-Yehuda, Ben-Yehuda, Schuster & Tsafrir (2013). *Deconstructing Amazon EC2 Spot Instance Pricing.* ACM TEAC.
+15. Menache, Shamir & Jain (2014). *On-demand, Spot, or Both.* ICAC.
+16. Abundo, Di Valerio, Cardellini & Lo Presti (2014). *Bidding Strategies in QoS-Aware Cloud Systems Based on N-Armed Bandit Problems.* NCCA.
+17. Khandelwal, Chaturvedi & Gupta (2018). *Bidding Strategies for Amazon EC2 Spot Instances — A Comprehensive Review.* ICCUBEA.
