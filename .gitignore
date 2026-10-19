@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-data/raw/swoopo/*.tsv
+data/raw/*
 .venv/
 *.egg-info/
 .venv/*
 results/*
+data/raw/
+data/processed/*
+data/processed/*summary*.csv
+!data/processed/.gitkeep
