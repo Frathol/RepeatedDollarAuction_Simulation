@@ -8,5 +8,5 @@ data/raw/*
 results/*
 data/raw/
 data/processed/*
-!data/processed/*summary*.csv
+data/processed/*summary*.csv
 !data/processed/.gitkeep
