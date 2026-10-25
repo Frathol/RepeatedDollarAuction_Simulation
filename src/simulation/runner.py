@@ -119,7 +119,13 @@ class AuctionSimulation:
         reward = DollarAuction.normalize_reward(
             result.agent_payoff, cfg.budget, cfg.stake)
         self.algorithm.update(
-            arm, reward, info={"agent_state_trace": result.agent_state_trace})
+            arm,
+            reward,
+            info={
+                "agent_state_trace": result.agent_state_trace,
+                "cost": float(result.agent_final_bid) / max(1, cfg.budget),
+            },
+        )
 
         if cfg.bob_signal == "theta":
             signal = self.thetas[arm] / cfg.budget
@@ -204,15 +210,23 @@ def make_simulation(
         key = algorithm.lower()
         if key == "elp":
             from src.algorithms.elp import ELP
-            algo = ELP(strategies=arms, thetas=thetas, stake=cfg.stake,
-                       budget=cfg.budget, horizon_T=cfg.T, rng=algo_rng)
+            algo = ELP(
+                strategies=arms, thetas=thetas, stake=cfg.stake,
+                budget=cfg.budget, horizon_T=cfg.T, rng=algo_rng,
+            )
         elif key == "exp3":
             from src.algorithms.exp3 import EXP3
             algo = EXP3(n_arms=len(arms), horizon_T=cfg.T, rng=algo_rng)
+        elif key == "ucb1":
+            from src.algorithms.ucb1 import UCB1
+            algo = UCB1(n_arms=len(arms), c=1.0, rng=algo_rng)
+        elif key in ("ts", "thompson_sampling"):
+            from src.algorithms.thompson_sampling import ThompsonSampling
+            algo = ThompsonSampling(n_arms=len(arms), rng=algo_rng)
         else:
             raise ValueError(
-                f"Unknown algorithm '{algorithm}'. Use 'elp', 'exp3', or pass "
-                "an instance (e.g. EXP3.S once exp3s.py exists)."
+                f"Unknown algorithm '{algorithm}'. Use 'elp', 'exp3', 'ucb1', "
+                "'ts', or pass a BanditAlgorithm instance."
             )
     else:
         algo = algorithm
