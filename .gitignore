@@ -10,3 +10,5 @@ data/raw/
 data/processed/*
 data/processed/*summary*.csv
 !data/processed/.gitkeep
+/.antigravityignore
+AGENTS.md
